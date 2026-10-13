@@ -1,0 +1,24 @@
+[package]
+name = "cvvdp-lite"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94.0"
+description = "Still-image ColorVideoVDP perceptual quality metric with reusable reference analysis"
+readme = "README.md"
+keywords = ["cvvdp", "image-quality", "metric", "perceptual", "vdp"]
+categories = ["multimedia::images", "computer-vision", "algorithms"]
+license = "BSD-3-Clause OR Apache-2.0"
+authors = ["Radzivon Bartoshyk"]
+documentation = "https://docs.rs/cvvdp-lite"
+homepage = "https://github.com/awxkee/cvvdp-lite"
+repository = "https://github.com/awxkee/cvvdp-lite"
+exclude = ["/tools", "/.github", "*.png", "*.jpg", "*.json"]
+
+[features]
+default = ["avx", "neon", "sse"]
+avx = []
+neon = []
+sse = []
+
+[package.metadata.docs.rs]
+all-features = true
