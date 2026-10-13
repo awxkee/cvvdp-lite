@@ -10,7 +10,6 @@ categories = ["multimedia::images", "computer-vision", "algorithms"]
 license = "BSD-3-Clause OR Apache-2.0"
 authors = ["Radzivon Bartoshyk"]
 documentation = "https://docs.rs/cvvdp-lite"
-homepage = "https://github.com/awxkee/cvvdp-lite"
 repository = "https://github.com/awxkee/cvvdp-lite"
 exclude = ["/tools", "/.github", "*.png", "*.jpg", "*.json", "/examples"]
 
