@@ -12,7 +12,7 @@ authors = ["Radzivon Bartoshyk"]
 documentation = "https://docs.rs/cvvdp-lite"
 homepage = "https://github.com/awxkee/cvvdp-lite"
 repository = "https://github.com/awxkee/cvvdp-lite"
-exclude = ["/tools", "/.github", "*.png", "*.jpg", "*.json"]
+exclude = ["/tools", "/.github", "*.png", "*.jpg", "*.json", "/examples"]
 
 [features]
 default = ["avx", "neon", "sse"]
