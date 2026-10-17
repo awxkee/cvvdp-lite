@@ -31,13 +31,15 @@
 //! drift. Math is restricted to positive normal inputs (x+epsilon), with
 //! normal masking power results. Display/input validation bounds that domain.
 
-use super::{Contrast, EPSILON, MASK_P, MASK_Q, Pool};
+use super::{Contrast, ContrastRegion, EPSILON, MASK_P, MASK_Q, Pool, TiledPool};
 
 /// # Safety
 /// Private vector implementations must provide LANES initialized f32 values,
 /// exact lane-wise arithmetic/bit operations, and f64 reduction accumulators.
 pub(crate) unsafe trait Vector: Copy {
     type F: Copy;
+    /// Integer SIMD exponents, kept exact between decomposition and lookup.
+    type E: Copy;
     type D: Copy;
     const LANES: usize;
     unsafe fn splat(v: f32) -> Self::F;
@@ -53,9 +55,9 @@ pub(crate) unsafe trait Vector: Copy {
     /// Keep result where the original positive input exceeds zero, else zero.
     unsafe fn positive(input: Self::F, result: Self::F) -> Self::F;
     /// x = mantissa * 2^exponent, mantissa in [sqrt(1/2),sqrt(2)).
-    unsafe fn decompose(x: Self::F) -> (Self::F, Self::F);
+    unsafe fn decompose(x: Self::F) -> (Self::F, Self::E);
     /// Lookup 2^(p*exponent), for exponents from decompose.
-    unsafe fn scale(exponent: Self::F, table: &[f32; 256]) -> Self::F;
+    unsafe fn scale(exponent: Self::E, table: &[f32; 256]) -> Self::F;
     unsafe fn zero_d() -> Self::D;
     unsafe fn accumulate(value: Self::F, lo: &mut Self::D, hi: &mut Self::D);
     unsafe fn sum_d(value: Self::D) -> f64;
@@ -152,10 +154,67 @@ pub(crate) fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
 }
 
 #[inline(always)]
+pub(crate) fn contrast_region<V: Vector>(data: &mut ContrastRegion<'_>) -> usize {
+    let done = data.width / V::LANES * V::LANES;
+    // SAFETY: Dispatch validates all strided inputs and compact outputs before
+    // entering this CPU-enabled kernel. Only complete row-local vectors run.
+    unsafe {
+        let scale = V::splat(data.scale);
+        let floor = V::splat(0.01);
+        let ceiling = V::splat(1000.0);
+        // Work through one channel's planes at a time. This keeps fewer row
+        // pointers live and reads/writes contiguous planes without staging.
+        for c in 0..3 {
+            let current = data.current[c].as_ptr();
+            let low = data.expanded[c].as_ptr();
+            let sensitivity = data.sensitivity[c].as_ptr();
+            let reference = data.reference[c].as_ptr();
+            let contrast = data.contrast[c].as_mut_ptr();
+            let mask = data.mask[c].as_mut_ptr();
+            for y in 0..data.height {
+                let src = y * data.source_stride;
+                let dst = y * data.width;
+                for x in (0..done).step_by(V::LANES) {
+                    let bg = V::max(V::load(data.expanded[0].as_ptr().add(dst + x)), floor);
+                    let current = V::load(current.add(src + x));
+                    let low = V::load(low.add(dst + x));
+                    let sensitivity = V::load(sensitivity.add(src + x));
+                    let reference = V::load(reference.add(src + x));
+                    let weighted = V::mul(
+                        V::mul(V::min(V::div(V::sub(current, low), bg), ceiling), scale),
+                        sensitivity,
+                    );
+                    V::store(contrast.add(dst + x), weighted);
+                    V::store(
+                        mask.add(dst + x),
+                        V::min(V::abs(weighted), V::abs(reference)),
+                    );
+                }
+            }
+        }
+    }
+    done
+}
+
+#[inline(always)]
 pub(crate) fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
+    pool_with_powers::<V>(data, power_tables())
+}
+
+#[inline(always)]
+pub(crate) fn pool_tiles<V: Vector>(data: &TiledPool<'_>, tiles: &mut [[f64; 3]], stride: usize) {
+    let powers = power_tables();
+    super::pool_tiles_with(data, tiles, stride, |row| {
+        let (done, mut squares) = pool_with_powers::<V>(row, powers);
+        super::pool_scalar_tail(row, done, &mut squares);
+        squares
+    });
+}
+
+#[inline(always)]
+fn pool_with_powers<V: Vector>(data: &Pool<'_>, powers: &[PowerTable; 4]) -> (usize, [f64; 3]) {
     let done = data.current[0].len() / V::LANES * V::LANES;
     let p = data.parameters;
-    let powers = power_tables();
     // SAFETY: Equal checked plane lengths cover every complete vector, CPU
     // features are enabled by the caller, and the arithmetic domain is bounded.
     unsafe {

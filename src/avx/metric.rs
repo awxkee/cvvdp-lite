@@ -42,6 +42,7 @@ struct Avx2;
 // the CPU feature, and checked input lengths cover all complete vectors.
 unsafe impl Vector for Avx2 {
     type F = __m256;
+    type E = __m256i;
     type D = __m256d;
     const LANES: usize = 8;
     #[inline(always)]
@@ -110,7 +111,7 @@ unsafe impl Vector for Avx2 {
         unsafe { _mm256_setzero_pd() }
     }
     #[inline(always)]
-    unsafe fn decompose(x: Self::F) -> (Self::F, Self::F) {
+    unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
         // SAFETY: The caller supplies positive normal inputs with AVX2 enabled.
         unsafe {
             let bits = _mm256_add_epi32(
@@ -122,16 +123,16 @@ unsafe impl Vector for Avx2 {
                 _mm256_and_si256(bits, _mm256_set1_epi32(0x007f_ffff)),
                 _mm256_set1_epi32(0x3f35_04f3),
             );
-            (_mm256_castsi256_ps(mantissa), _mm256_cvtepi32_ps(exponent))
+            (_mm256_castsi256_ps(mantissa), exponent)
         }
     }
     #[inline(always)]
-    unsafe fn scale(exponent: Self::F, table: &[f32; 256]) -> Self::F {
+    unsafe fn scale(exponent: Self::E, table: &[f32; 256]) -> Self::F {
         // SAFETY: AVX2 is enabled. Every lookup index is masked
         // to the allocated table's 256 initialized entries.
         unsafe {
             let index = _mm256_and_si256(
-                _mm256_add_epi32(_mm256_cvttps_epi32(exponent), _mm256_set1_epi32(127)),
+                _mm256_add_epi32(exponent, _mm256_set1_epi32(127)),
                 _mm256_set1_epi32(255),
             );
             _mm256_i32gather_ps::<4>(table.as_ptr(), index)
@@ -162,9 +163,23 @@ pub(crate) fn contrast_avx2(data: &mut Contrast<'_>) -> usize {
     vector::contrast::<Avx2>(data)
 }
 #[target_feature(enable = "avx2")]
+pub(crate) fn contrast_region_avx2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // Dispatch validates strided planes, compact outputs and AVX2 availability.
+    vector::contrast_region::<Avx2>(data)
+}
+#[target_feature(enable = "avx2")]
 pub(crate) fn pool_avx2(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and AVX2 availability.
     vector::pool::<Avx2>(data)
+}
+#[target_feature(enable = "avx2")]
+pub(crate) fn pool_tiles_avx2(
+    data: &crate::kernels::TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates all strip strides, output lengths and AVX2 availability.
+    vector::pool_tiles::<Avx2>(data, tiles, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "avx2")]

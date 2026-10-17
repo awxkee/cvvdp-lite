@@ -40,6 +40,7 @@ struct Neon;
 // enable NEON; checked slice lengths cover the unaligned loads and stores.
 unsafe impl Vector for Neon {
     type F = float32x4_t;
+    type E = int32x4_t;
     type D = float64x2_t;
     const LANES: usize = 4;
     #[inline(always)]
@@ -113,7 +114,7 @@ unsafe impl Vector for Neon {
         unsafe { vaddvq_f64(value) }
     }
     #[inline(always)]
-    unsafe fn decompose(x: Self::F) -> (Self::F, Self::F) {
+    unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
         // SAFETY: Positive normal inputs and enabled NEON are guaranteed by the caller.
         unsafe {
             let bits = vaddq_u32(
@@ -128,16 +129,16 @@ unsafe impl Vector for Neon {
                 vandq_u32(bits, vdupq_n_u32(0x007f_ffff)),
                 vdupq_n_u32(0x3f35_04f3),
             );
-            (vreinterpretq_f32_u32(mantissa), vcvtq_f32_s32(exponent))
+            (vreinterpretq_f32_u32(mantissa), exponent)
         }
     }
     #[inline(always)]
-    unsafe fn scale(exponent: Self::F, table: &[f32; 256]) -> Self::F {
+    unsafe fn scale(exponent: Self::E, table: &[f32; 256]) -> Self::F {
         // SAFETY: NEON is enabled. Masked integer lookup indices always lie
         // within the table, including if an internal caller violates the domain.
         unsafe {
             let index = vandq_u32(
-                vreinterpretq_u32_s32(vaddq_s32(vcvtq_s32_f32(exponent), vdupq_n_s32(127))),
+                vreinterpretq_u32_s32(vaddq_s32(exponent, vdupq_n_s32(127))),
                 vdupq_n_u32(255),
             );
             let values = [
@@ -168,9 +169,23 @@ pub(crate) fn contrast_neon(data: &mut Contrast<'_>) -> usize {
     vector::contrast::<Neon>(data)
 }
 #[target_feature(enable = "neon")]
+pub(crate) fn contrast_region_neon(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // Dispatch validates strided planes, compact outputs and NEON availability.
+    vector::contrast_region::<Neon>(data)
+}
+#[target_feature(enable = "neon")]
 pub(crate) fn pool_neon(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates all plane lengths and NEON availability.
     vector::pool::<Neon>(data)
+}
+#[target_feature(enable = "neon")]
+pub(crate) fn pool_tiles_neon(
+    data: &crate::kernels::TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates all strip strides, output lengths and NEON availability.
+    vector::pool_tiles::<Neon>(data, tiles, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]

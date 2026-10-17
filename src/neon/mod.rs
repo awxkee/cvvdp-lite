@@ -36,7 +36,7 @@ pub(crate) use blur::{blur_horizontal_neon, blur_vertical_neon};
 pub(crate) use image::{dkl_bytes_neon, dkl_linear_neon};
 #[cfg(test)]
 pub(crate) use metric::powers_neon;
-pub(crate) use metric::{contrast_neon, pool_neon};
+pub(crate) use metric::{contrast_neon, contrast_region_neon, pool_neon, pool_tiles_neon};
 pub(crate) use pyramid::{
     expand_even_neon, expand_horizontal_neon, expand_odd_neon, reduce_horizontal_neon,
     reduce_vertical_neon,

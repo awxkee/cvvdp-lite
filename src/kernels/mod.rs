@@ -103,11 +103,40 @@ pub(crate) struct Contrast<'a> {
     scale: f32,
 }
 
+/// A compact output strip reading Gaussian/reference rows at `source_stride`.
+/// The expanded planes and both outputs contain exactly width * height pixels.
+pub(crate) struct ContrastRegion<'a> {
+    pub current: [&'a [f32]; 3],
+    pub expanded: [&'a [f32]; 3],
+    pub sensitivity: [&'a [f32]; 3],
+    pub reference: [&'a [f32]; 3],
+    pub contrast: [&'a mut [f32]; 3],
+    pub mask: [&'a mut [f32]; 3],
+    pub width: usize,
+    pub height: usize,
+    pub source_stride: usize,
+    pub scale: f32,
+}
+
 pub(crate) struct Pool<'a> {
     current: [&'a [f32]; 3],
     reference: [&'a [f32]; 3],
     blurred: [&'a [f32]; 3],
     parameters: MaskParameters,
+}
+
+pub(crate) const POOL_TILE: usize = 8;
+
+/// A tile-aligned strip. Each input starts at its upper-left pixel and may
+/// have a different row stride (contrast halo, full reference, pooled masks).
+pub(crate) struct TiledPool<'a> {
+    pub current: [&'a [f32]; 3],
+    pub reference: [&'a [f32]; 3],
+    pub blurred: [&'a [f32]; 3],
+    pub strides: [usize; 3],
+    pub width: usize,
+    pub height: usize,
+    pub parameters: MaskParameters,
 }
 
 #[allow(unused_mut, unused_unsafe)] // Scalar-only builds have no dispatch block.
@@ -170,6 +199,87 @@ pub(crate) fn contrast(
     }
 }
 
+/// Fuse the Gaussian-to-scratch copy with contrast conversion. Validate and
+/// dispatch once per strip, retaining the old per-row SIMD/tail boundaries.
+#[allow(unused_mut, unused_unsafe)]
+pub(crate) fn contrast_region(backend: Backend, mut data: ContrastRegion<'_>) {
+    assert!(backend.is_available());
+    assert!(data.width > 0 && data.height > 0 && data.source_stride >= data.width);
+    let count = data
+        .width
+        .checked_mul(data.height)
+        .expect("contrast output size overflow");
+    let required = (data.height - 1)
+        .checked_mul(data.source_stride)
+        .and_then(|n| n.checked_add(data.width))
+        .expect("contrast input size overflow");
+    assert!(
+        data.current
+            .iter()
+            .chain(&data.sensitivity)
+            .chain(&data.reference)
+            .all(|p| p.len() >= required)
+    );
+    assert!(data.expanded.iter().all(|p| p.len() == count));
+    assert!(
+        data.contrast
+            .iter()
+            .chain(&data.mask)
+            .all(|p| p.len() == count)
+    );
+    let mut done = 0;
+    // SAFETY: Input strides cover every source row, compact planes have the
+    // checked pixel count, and only a CPU-supported target-feature entry runs.
+    unsafe {
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        if backend == Backend::Neon {
+            done = crate::neon::contrast_region_neon(&mut data);
+        }
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Avx2 {
+            done = crate::avx::contrast_region_avx2(&mut data);
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Sse2 {
+            done = crate::sse::contrast_region_sse2(&mut data);
+        }
+    }
+    let n = data.width - done;
+    if n == 0 {
+        return;
+    }
+    let luminance = data.expanded[0];
+    // Slice each row once, then let iterators carry its bounds through the
+    // scalar fallback/tail instead of indexing all six planes per sample.
+    for (c, (contrast, mask)) in data.contrast.into_iter().zip(data.mask).enumerate() {
+        let current = data.current[c];
+        let expanded = data.expanded[c];
+        let sensitivity = data.sensitivity[c];
+        let reference = data.reference[c];
+        for y in 0..data.height {
+            let src = y * data.source_stride + done;
+            let dst = y * data.width + done;
+            let inputs = current[src..src + n].iter().zip(&expanded[dst..dst + n]);
+            let weights = sensitivity[src..src + n]
+                .iter()
+                .zip(&reference[src..src + n]);
+            let output = contrast[dst..dst + n]
+                .iter_mut()
+                .zip(&mut mask[dst..dst + n]);
+            for ((((&value, &low), &bg), (&sensitivity, &reference)), (contrast, mask)) in inputs
+                .zip(&luminance[dst..dst + n])
+                .zip(weights)
+                .zip(output)
+            {
+                let weighted =
+                    ((value - low) / bg.max(0.01)).min(1000.0) * data.scale * sensitivity;
+                *contrast = weighted;
+                *mask = weighted.abs().min(reference.abs());
+            }
+        }
+    }
+}
+
 #[allow(unused_mut, unused_unsafe)] // Scalar-only builds have no dispatch block.
 pub(crate) fn pool(
     backend: Backend,
@@ -193,7 +303,6 @@ pub(crate) fn pool(
         blurred,
         parameters,
     };
-    let parameters = data.parameters;
     let (mut done, mut squares) = (0, [0.0; 3]);
     // SAFETY: All input planes have the checked initialized count, and backend
     // is CPU-validated by Workspace. SIMD loops only consume complete vectors.
@@ -212,6 +321,14 @@ pub(crate) fn pool(
         }
     }
     let _ = backend;
+    pool_scalar_tail(&data, done, &mut squares);
+    squares
+}
+
+#[inline]
+fn pool_scalar_tail(data: &Pool<'_>, done: usize, squares: &mut [f64; 3]) {
+    let parameters = data.parameters;
+    let count = data.current[0].len();
     for i in done..count {
         let activity: [f32; 3] = std::array::from_fn(|c| {
             (data.blurred[c][i] * parameters.mask_c + EPSILON).powf(MASK_Q[c])
@@ -227,7 +344,89 @@ pub(crate) fn pool(
             *sum += d * d + 2.0 * (EPSILON as f64) * d;
         }
     }
-    squares
+}
+
+/// Dispatch and validate once for a whole strip, writing directly into the
+/// existing tile cache. Row reductions and scalar tails stay tile-local.
+#[allow(unused_unsafe)]
+pub(crate) fn pool_tiles(
+    backend: Backend,
+    data: &TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    tile_stride: usize,
+) {
+    assert!(backend.is_available());
+    assert!(data.width > 0 && data.height > 0);
+    for (planes, stride) in [data.current, data.reference, data.blurred]
+        .iter()
+        .zip(data.strides)
+    {
+        assert!(stride >= data.width);
+        let required = (data.height - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(data.width))
+            .expect("pool input size overflow");
+        assert!(planes.iter().all(|plane| plane.len() >= required));
+    }
+    let columns = data.width.div_ceil(POOL_TILE);
+    let rows = data.height.div_ceil(POOL_TILE);
+    assert!(tile_stride >= columns);
+    let required = (rows - 1)
+        .checked_mul(tile_stride)
+        .and_then(|n| n.checked_add(columns))
+        .expect("pool output size overflow");
+    assert!(tiles.len() >= required);
+    // SAFETY: Every input covers the strip at its checked stride and the tile
+    // output covers every written row. Only CPU-supported entries are called.
+    unsafe {
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        if backend == Backend::Neon {
+            return crate::neon::pool_tiles_neon(data, tiles, tile_stride);
+        }
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Avx2 {
+            return crate::avx::pool_tiles_avx2(data, tiles, tile_stride);
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Sse2 {
+            return crate::sse::pool_tiles_sse2(data, tiles, tile_stride);
+        }
+    }
+    pool_tiles_with(data, tiles, tile_stride, |row| {
+        let mut squares = [0.0; 3];
+        pool_scalar_tail(row, 0, &mut squares);
+        squares
+    });
+}
+
+#[inline]
+fn pool_tiles_with(
+    data: &TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    tile_stride: usize,
+    mut pool_row: impl FnMut(&Pool<'_>) -> [f64; 3],
+) {
+    let columns = data.width.div_ceil(POOL_TILE);
+    for (ty, y0) in (0..data.height).step_by(POOL_TILE).enumerate() {
+        let out = &mut tiles[ty * tile_stride..][..columns];
+        for (sums, x0) in out.iter_mut().zip((0..data.width).step_by(POOL_TILE)) {
+            *sums = [0.0; 3];
+            let n = POOL_TILE.min(data.width - x0);
+            for y in y0..(y0 + POOL_TILE).min(data.height) {
+                let [c, r, b] = data.strides.map(|stride| y * stride + x0);
+                let row = Pool {
+                    current: data.current.map(|v| &v[c..c + n]),
+                    reference: data.reference.map(|v| &v[r..r + n]),
+                    blurred: data.blurred.map(|v| &v[b..b + n]),
+                    parameters: data.parameters,
+                };
+                let part = pool_row(&row);
+                for (sum, value) in sums.iter_mut().zip(part) {
+                    *sum += value;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn warmup(backend: Backend) {
@@ -243,6 +442,12 @@ pub(crate) fn warmup(backend: Backend) {
     }
     let _ = backend;
 }
+
+#[cfg(test)]
+mod contrast_tests;
+
+#[cfg(test)]
+mod tile_tests;
 
 #[cfg(test)]
 mod tests {
