@@ -31,7 +31,7 @@
 //! the first candidate and switching to smaller references with odd depths.
 #![allow(unsafe_code)]
 
-use cvvdp_lite::{CvvdpLite, Display, RgbImage, Workspace};
+use cvvdp_lite::{Checkpoint, CvvdpLite, Display, IncrementalState, Rect, RgbImage, Workspace};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     cell::Cell,
@@ -173,4 +173,69 @@ fn reserved_workspace_allocates_nothing_on_first_or_repeated_candidates() {
         assert_eq!(score.jod, 10.0);
         workspace = evaluator.into_workspace();
     }
+}
+
+#[test]
+fn incremental_updates_reuse_scratch_and_warmed_checkpoints() {
+    let metric = CvvdpLite::new(Display::default()).unwrap();
+    for (w, h) in [(129, 513), (513, 129), (7, 513), (513, 7), (1, 17)] {
+        let pixels: Vec<u8> = (0..w * h * 3).map(|i| (i * 31 % 256) as u8).collect();
+        let image = RgbImage::srgb8(&pixels, w, h, w * 3).unwrap();
+        let reference = metric.prepare_reference(image).unwrap();
+        let mut state = IncrementalState::new(&reference, image).unwrap();
+        let state_bytes = state.allocated_bytes();
+        let mut checkpoint = Checkpoint::default();
+        let full = Rect::new(0, 0, w, h);
+        // A full-image checkpoint has room for any later update footprint.
+        state
+            .update_checkpointed(&reference, image, full, &mut checkpoint)
+            .unwrap();
+        state.rollback(&checkpoint);
+        let checkpoint_bytes = checkpoint.allocated_bytes();
+        for rect in [
+            Rect::new(w / 3, h / 3, (w / 3 + 32).min(w), (h / 3 + 32).min(h)),
+            Rect::new(w - 1, h - 1, w, h),
+            Rect::new(0, 0, 1, 1),
+            Rect::new(0, 0, w, h.min(65)),
+            full,
+        ] {
+            let (score, allocations) = measured(|| state.update(&reference, image, rect).unwrap());
+            assert_eq!(allocations, 0, "{w}x{h} update allocated for {rect:?}");
+            assert_eq!(score.jod, 10.0);
+            let (_, allocations) = measured(|| {
+                state
+                    .update_checkpointed(&reference, image, rect, &mut checkpoint)
+                    .unwrap();
+                state.rollback(&checkpoint);
+            });
+            assert_eq!(
+                allocations, 0,
+                "{w}x{h} checkpoint/rollback allocated for {rect:?}"
+            );
+            assert_eq!(state.score().jod, 10.0);
+            assert_eq!(state.allocated_bytes(), state_bytes);
+            assert_eq!(checkpoint.allocated_bytes(), checkpoint_bytes);
+        }
+    }
+}
+
+#[test]
+fn incremental_state_does_not_retain_full_image_scratch() {
+    let metric = CvvdpLite::new(Display::default()).unwrap();
+    // At fixed width, another row should add only the persistent Gaussian
+    // pyramid and tile sums, not the temporary contrast/expansion/mask planes.
+    let w = 257;
+    let bytes = [257, 1025].map(|h| {
+        let pixels = vec![128; w * h * 3];
+        let image = RgbImage::srgb8(&pixels, w, h, w * 3).unwrap();
+        let reference = metric.prepare_reference(image).unwrap();
+        IncrementalState::new(&reference, image)
+            .unwrap()
+            .allocated_bytes()
+    });
+    let added_pixels = w * (1025 - 257);
+    assert!(
+        bytes[1] - bytes[0] < added_pixels * 18,
+        "unexpected image-sized scratch: {bytes:?}"
+    );
 }

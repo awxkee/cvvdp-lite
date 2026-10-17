@@ -66,7 +66,21 @@ fn displays() -> [Display; 2] {
     ]
 }
 
-const SIZES: [(usize, usize); 6] = [(8, 8), (13, 29), (64, 64), (67, 45), (131, 200), (300, 177)];
+const SIZES: [(usize, usize); 13] = [
+    (1, 1),
+    (1, 17),
+    (17, 1),
+    (2, 65),
+    (7, 129),
+    (129, 7),
+    (8, 8),
+    (13, 29),
+    (64, 64),
+    (67, 45),
+    (131, 200),
+    (300, 177),
+    (257, 193),
+];
 
 #[test]
 fn fresh_state_matches_full_comparison() {
@@ -94,7 +108,10 @@ fn fresh_state_matches_full_comparison() {
 
 #[test]
 fn updates_reach_the_fresh_state_exactly() {
-    for backend in [Backend::Scalar, Backend::detect()] {
+    for backend in [Backend::Scalar, Backend::Neon, Backend::Sse2, Backend::Avx2] {
+        if !backend.is_available() {
+            continue;
+        }
         let metric = CvvdpLite::new(Display::standard_4k()).unwrap();
         for (w, h) in SIZES {
             let reference = planes(w, h, 3);
@@ -106,7 +123,14 @@ fn updates_reach_the_fresh_state_exactly() {
             for step in 0..12usize {
                 let x0 = (step * 37) % w;
                 let y0 = (step * 23) % h;
-                let rect = Rect::new(x0, y0, (x0 + 5 + step * 3).min(w), (y0 + 4 + step).min(h));
+                let rect = match step {
+                    // Cross multiple scratch strips and exercise every image edge.
+                    0 => Rect::new(0, 0, w, h),
+                    1 => Rect::new(0, 0, w.min(9), h.min(9)),
+                    2 => Rect::new(w.saturating_sub(9), h.saturating_sub(9), w, h),
+                    3 => Rect::new(0, h / 3, w, (h / 3 + 81).min(h)),
+                    _ => Rect::new(x0, y0, (x0 + 5 + step * 3).min(w), (y0 + 4 + step).min(h)),
+                };
                 let saved = test.clone();
                 for (c, plane) in test.iter_mut().enumerate() {
                     let delta = 0.3 * ((step + c) as f32 * 0.7).sin();

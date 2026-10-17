@@ -42,6 +42,7 @@ struct Sse2;
 // the CPU feature, and checked input lengths cover all complete vectors.
 unsafe impl Vector for Sse2 {
     type F = __m128;
+    type E = __m128i;
     type D = __m128d;
     const LANES: usize = 4;
     #[inline(always)]
@@ -105,7 +106,7 @@ unsafe impl Vector for Sse2 {
         unsafe { _mm_setzero_pd() }
     }
     #[inline(always)]
-    unsafe fn decompose(x: Self::F) -> (Self::F, Self::F) {
+    unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
         // SAFETY: The caller supplies positive normal inputs with SSE2 enabled.
         unsafe {
             let bits = _mm_add_epi32(
@@ -117,16 +118,16 @@ unsafe impl Vector for Sse2 {
                 _mm_and_si128(bits, _mm_set1_epi32(0x007f_ffff)),
                 _mm_set1_epi32(0x3f35_04f3),
             );
-            (_mm_castsi128_ps(mantissa), _mm_cvtepi32_ps(exponent))
+            (_mm_castsi128_ps(mantissa), exponent)
         }
     }
     #[inline(always)]
-    unsafe fn scale(exponent: Self::F, table: &[f32; 256]) -> Self::F {
+    unsafe fn scale(exponent: Self::E, table: &[f32; 256]) -> Self::F {
         // SAFETY: SSE2 is enabled. Every lookup index is masked
         // to the allocated table's 256 initialized entries.
         unsafe {
             let index = _mm_and_si128(
-                _mm_add_epi32(_mm_cvttps_epi32(exponent), _mm_set1_epi32(127)),
+                _mm_add_epi32(exponent, _mm_set1_epi32(127)),
                 _mm_set1_epi32(255),
             );
             let mut indices = [0_i32; 4];
@@ -164,9 +165,23 @@ pub(crate) fn contrast_sse2(data: &mut Contrast<'_>) -> usize {
     vector::contrast::<Sse2>(data)
 }
 #[target_feature(enable = "sse2")]
+pub(crate) fn contrast_region_sse2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // Dispatch validates strided planes, compact outputs and SSE2 availability.
+    vector::contrast_region::<Sse2>(data)
+}
+#[target_feature(enable = "sse2")]
 pub(crate) fn pool_sse2(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and SSE2 availability.
     vector::pool::<Sse2>(data)
+}
+#[target_feature(enable = "sse2")]
+pub(crate) fn pool_tiles_sse2(
+    data: &crate::kernels::TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates all strip strides, output lengths and SSE2 availability.
+    vector::pool_tiles::<Sse2>(data, tiles, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "sse2")]

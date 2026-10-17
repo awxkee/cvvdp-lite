@@ -87,6 +87,53 @@ impl Kernels {
             _ => unreachable!("unavailable backend rejected above"),
         }
     }
+
+    pub(crate) fn reduce_vertical(&self, rows: &Rows<'_, 5>, out: &mut [f32]) {
+        let done = (self.reduce_vertical)(rows, out);
+        let [r0, r1, r2, r3, r4] = rows.map(|row| &row[done..]);
+        let outer = r0.iter().zip(r4);
+        let inner = r1.iter().zip(r3);
+        for ((((a, e), (b, d)), c), dst) in outer.zip(inner).zip(r2).zip(&mut out[done..]) {
+            *dst = 0.05 * (a + e) + 0.25 * (b + d) + 0.4 * c;
+        }
+    }
+
+    /// Interior outputs; `src` starts two samples before the first center.
+    pub(crate) fn reduce_horizontal(&self, src: &[f32], out: &mut [f32]) {
+        let done = (self.reduce_horizontal)(src, out);
+        let taps = src[2 * done..].array_windows::<5>().step_by(2);
+        for (taps, dst) in taps.zip(&mut out[done..]) {
+            *dst = 0.05 * (taps[0] + taps[4]) + 0.25 * (taps[1] + taps[3]) + 0.4 * taps[2];
+        }
+    }
+
+    pub(crate) fn expand_even(&self, rows: &Rows<'_, 3>, out: &mut [f32]) {
+        let done = (self.expand_even)(rows, out);
+        let [before, center, after] = rows.map(|row| &row[done..]);
+        for (((before, after), center), dst) in
+            before.iter().zip(after).zip(center).zip(&mut out[done..])
+        {
+            *dst = 0.1 * (before + after) + 0.8 * center;
+        }
+    }
+
+    pub(crate) fn expand_odd(&self, rows: &Rows<'_, 2>, out: &mut [f32]) {
+        let done = (self.expand_odd)(rows, out);
+        let [center, after] = rows.map(|row| &row[done..]);
+        for ((center, after), dst) in center.iter().zip(after).zip(&mut out[done..]) {
+            *dst = 0.5 * (center + after);
+        }
+    }
+
+    /// Whole interior even/odd pairs, starting one coarse sample before center.
+    pub(crate) fn expand_horizontal(&self, src: &[f32], out: &mut [f32]) {
+        let done = (self.expand_horizontal)(src, out);
+        let taps = src[done / 2..].array_windows::<3>();
+        for (taps, pair) in taps.zip(out[done..].as_chunks_mut::<2>().0) {
+            pair[0] = 0.1 * (taps[0] + taps[2]) + 0.8 * taps[1];
+            pair[1] = 0.5 * (taps[1] + taps[2]);
+        }
+    }
 }
 
 pub(crate) fn reduce(
@@ -104,13 +151,7 @@ pub(crate) fn reduce(
     let mut vertical = |y: usize, indices: [usize; 5]| {
         let rows = indices.map(|sy| &src[sy * w..(sy + 1) * w]);
         let out = &mut tmp[y * w..(y + 1) * w];
-        let done = (kernels.reduce_vertical)(&rows, out);
-        let [r0, r1, r2, r3, r4] = rows.map(|row| &row[done..]);
-        let outer = r0.iter().zip(r4);
-        let inner = r1.iter().zip(r3);
-        for ((((a, e), (b, d)), c), dst) in outer.zip(inner).zip(r2).zip(&mut out[done..]) {
-            *dst = 0.05 * (a + e) + 0.25 * (b + d) + 0.4 * c;
-        }
+        kernels.reduce_vertical(&rows, out);
     };
     // Only the first and final output rows need reflection. Interior row
     // offsets are direct, and SIMD spans the entire row including its columns.
@@ -133,11 +174,7 @@ pub(crate) fn reduce(
     {
         out[0] = reduce_border(row, 0);
         if end > 1 {
-            let done = (kernels.reduce_horizontal)(row, &mut out[1..end]);
-            let taps = row[2 * done..].array_windows::<5>().step_by(2);
-            for (taps, dst) in taps.zip(&mut out[1 + done..end]) {
-                *dst = 0.05 * (taps[0] + taps[4]) + 0.25 * (taps[1] + taps[3]) + 0.4 * taps[2];
-            }
+            kernels.reduce_horizontal(row, &mut out[1..end]);
         }
         for (x, dst) in out.iter_mut().enumerate().skip(end) {
             *dst = reduce_border(row, x);
@@ -173,20 +210,10 @@ pub(crate) fn expand(
         let after = (sy + 1).min(sh - 1);
         let rows = [before, sy, after].map(|r| &src[r * sw..(r + 1) * sw]);
         let (out, odd) = pair.split_at_mut(sw);
-        let done = (kernels.expand_even)(&rows, out);
-        let [before, center, after] = rows.map(|row| &row[done..]);
-        for (((before, after), center), dst) in
-            before.iter().zip(after).zip(center).zip(&mut out[done..])
-        {
-            *dst = 0.1 * (before + after) + 0.8 * center;
-        }
+        kernels.expand_even(&rows, out);
         if !odd.is_empty() {
             let rows = [rows[1], rows[2]];
-            let done = (kernels.expand_odd)(&rows, odd);
-            let [center, after] = rows.map(|row| &row[done..]);
-            for ((center, after), dst) in center.iter().zip(after).zip(&mut odd[done..]) {
-                *dst = 0.5 * (center + after);
-            }
+            kernels.expand_odd(&rows, odd);
         }
     }
     for (row, out) in tmp[..sw * h]
@@ -196,12 +223,7 @@ pub(crate) fn expand(
         expand_border(row, 0, out);
         let end = sw.saturating_sub(1);
         if end > 1 {
-            let done = (kernels.expand_horizontal)(row, &mut out[2..2 * end]);
-            let taps = row[done / 2..].array_windows::<3>();
-            for (taps, pair) in taps.zip(out[2 + done..2 * end].as_chunks_mut::<2>().0) {
-                pair[0] = 0.1 * (taps[0] + taps[2]) + 0.8 * taps[1];
-                pair[1] = 0.5 * (taps[1] + taps[2]);
-            }
+            kernels.expand_horizontal(row, &mut out[2..2 * end]);
         }
         if end > 0 {
             expand_border(row, end, out);

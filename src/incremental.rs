@@ -44,10 +44,14 @@ use crate::blur::{self, GaussianBlur, RADIUS};
 use crate::image::RgbToDkl;
 use crate::kernels::{self, EPSILON, MaskParameters};
 use crate::model::{self, PreparedReference};
+use crate::pyramid::{self, ensure_len};
 use crate::{Backend, Error, RgbImage, Score};
 
-const TILE: usize = 8;
+const TILE: usize = kernels::POOL_TILE;
 const ALIGN: usize = 8;
+// Keep temporary images independent of image height. Whole tile rows preserve
+// the SIMD lane placement and summation order of every pooled tile.
+const POOL_ROWS: usize = 64;
 
 /// A half-open pixel rectangle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,8 +200,8 @@ impl Level {
     fn sum_tile_row(&mut self, ty: usize) {
         let mut sums = [0.0f64; 3];
         for tile in &self.tiles[ty * self.tiles_x..(ty + 1) * self.tiles_x] {
-            for c in 0..3 {
-                sums[c] += tile[c];
+            for (sum, value) in sums.iter_mut().zip(tile) {
+                *sum += value;
             }
         }
         self.row_sums[ty] = sums;
@@ -211,9 +215,31 @@ struct Scratch {
     expanded: [Vec<f32>; 3],
     contrast: [Vec<f32>; 3],
     mask: [Vec<f32>; 3],
-    horizontal: [Vec<f32>; 3],
     blurred: [Vec<f32>; 3],
     padded: Vec<f32>,
+}
+
+impl Scratch {
+    fn reserve(&mut self, w: usize, h: usize) {
+        let area = w * h.min(POOL_ROWS + 2 * RADIUS);
+        let pooled = w * h.min(POOL_ROWS);
+        for plane in &mut self.row {
+            ensure_len(plane, w);
+        }
+        for plane in self
+            .expanded
+            .iter_mut()
+            .chain(&mut self.contrast)
+            .chain(&mut self.mask)
+        {
+            ensure_len(plane, area);
+        }
+        for plane in &mut self.blurred {
+            ensure_len(plane, pooled);
+        }
+        ensure_len(&mut self.tmp, w);
+        self.padded.reserve_exact(w + 2 * RADIUS);
+    }
 }
 
 /// What an update overwrote, for an exact [`IncrementalState::rollback`].
@@ -225,11 +251,21 @@ pub struct Checkpoint {
     base: [f64; 3],
 }
 
+impl Checkpoint {
+    /// Heap bytes retained for rollback, excluding allocator overhead.
+    pub fn allocated_bytes(&self) -> usize {
+        self.gauss.capacity() * std::mem::size_of::<(usize, Rect)>()
+            + self.gauss_data.capacity() * std::mem::size_of::<f32>()
+            + self.tiles.capacity() * std::mem::size_of::<(usize, usize, [f64; 3])>()
+    }
+}
+
 /// Incrementally maintained score of one test image against a prepared reference.
 pub struct IncrementalState {
     backend: Backend,
     conversion: RgbToDkl,
     blur: GaussianBlur,
+    pyramid: pyramid::Kernels,
     params: MaskParameters,
     width: usize,
     height: usize,
@@ -239,6 +275,38 @@ pub struct IncrementalState {
 }
 
 impl IncrementalState {
+    /// Heap bytes retained by the pyramid, tile sums and scratch buffers,
+    /// excluding the shared reference and allocator overhead.
+    pub fn allocated_bytes(&self) -> usize {
+        let scratch = &self.scratch;
+        self.levels.capacity() * std::mem::size_of::<Level>()
+            + self
+                .levels
+                .iter()
+                .map(|level| {
+                    level
+                        .gauss
+                        .iter()
+                        .map(|v| v.capacity() * std::mem::size_of::<f32>())
+                        .sum::<usize>()
+                        + (level.tiles.capacity() + level.row_sums.capacity())
+                            * std::mem::size_of::<[f64; 3]>()
+                })
+                .sum::<usize>()
+            + scratch
+                .row
+                .iter()
+                .chain(&scratch.expanded)
+                .chain(&scratch.contrast)
+                .chain(&scratch.mask)
+                .chain(&scratch.blurred)
+                .chain([&scratch.tmp, &scratch.padded])
+                .map(|v| v.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>()
+            + self.blur.allocated_bytes()
+            + self.conversion.allocated_bytes()
+    }
+
     /// Score `test` in full and keep the analysis for later updates.
     pub fn new(reference: &PreparedReference, test: RgbImage<'_>) -> Result<Self, Error> {
         Self::with_backend(reference, test, Backend::detect())
@@ -289,6 +357,7 @@ impl IncrementalState {
             backend,
             conversion: RgbToDkl::new(backend),
             blur: GaussianBlur::new(backend),
+            pyramid: pyramid::Kernels::for_backend(backend),
             params: model::mask_parameters(),
             width: test.width,
             height: test.height,
@@ -296,6 +365,7 @@ impl IncrementalState {
             base: [0.0; 3],
             scratch: Scratch::default(),
         };
+        state.scratch.reserve(test.width, test.height);
         state.apply(reference, test, Rect::full(test.width, test.height), None)?;
         Ok(state)
     }
@@ -310,8 +380,8 @@ impl IncrementalState {
             } else {
                 let mut sums = [0.0f64; 3];
                 for row in &level.row_sums {
-                    for c in 0..3 {
-                        sums[c] += row[c];
+                    for (sum, value) in sums.iter_mut().zip(row) {
+                        *sum += value;
                     }
                 }
                 sums
@@ -367,10 +437,16 @@ impl IncrementalState {
         for &(k, t, sums) in checkpoint.tiles.iter().rev() {
             self.levels[k].tiles[t] = sums;
         }
+        // Checkpoint tiles are stored by level, then by row, then by column.
+        // Restore all tiles before summing each affected row exactly once.
+        let mut previous = None;
         for &(k, t, _) in &checkpoint.tiles {
             let level = &mut self.levels[k];
             let ty = t / level.tiles_x;
-            level.sum_tile_row(ty);
+            if previous != Some((k, ty)) {
+                level.sum_tile_row(ty);
+                previous = Some((k, ty));
+            }
         }
         self.base = checkpoint.base;
     }
@@ -415,9 +491,9 @@ impl IncrementalState {
                 &mut self.conversion,
             )?;
             let level = &mut self.levels[0];
-            for c in 0..3 {
-                level.gauss[c][y * level.w + dirty.x0..][..dirty.width()]
-                    .copy_from_slice(&self.scratch.row[c][..dirty.width()]);
+            for (plane, row) in level.gauss.iter_mut().zip(&self.scratch.row) {
+                plane[y * level.w + dirty.x0..][..dirty.width()]
+                    .copy_from_slice(&row[..dirty.width()]);
             }
         }
         let base_index = self.levels.len() - 1;
@@ -461,30 +537,37 @@ impl IncrementalState {
         let lo = (2 * out.x0).saturating_sub(2);
         let hi = (2 * out.x1 + 1).min(w);
         let tmp = &mut self.scratch.tmp;
-        tmp.resize(hi - lo, 0.0);
-        for c in 0..3 {
-            let s = &src.gauss[c];
+        ensure_len(tmp, hi - lo);
+        let tmp = &mut tmp[..hi - lo];
+        let start = out.x0.max(1);
+        let end = out.x1.min(((w - 1) / 2).max(1));
+        for (s, d) in src.gauss.iter().zip(&mut dst.gauss) {
             for y in out.y0..out.y1 {
-                let rows: [usize; 5] =
-                    std::array::from_fn(|i| reflect((2 * y) as isize + i as isize - 2, h) * w);
-                for (xx, t) in (lo..hi).zip(tmp.iter_mut()) {
-                    *t = 0.05 * (s[rows[0] + xx] + s[rows[4] + xx])
-                        + 0.25 * (s[rows[1] + xx] + s[rows[3] + xx])
-                        + 0.4 * s[rows[2] + xx];
-                }
-                let row = &mut dst.gauss[c][y * dst.w..(y + 1) * dst.w];
-                for (x, d) in row.iter_mut().enumerate().take(out.x1).skip(out.x0) {
-                    let xx = 2 * x;
-                    if xx >= 2 && xx + 2 < w {
-                        let t = &tmp[xx - 2 - lo..xx + 3 - lo];
-                        *d = 0.05 * (t[0] + t[4]) + 0.25 * (t[1] + t[3]) + 0.4 * t[2];
-                        continue;
-                    }
-                    let xx = xx as isize;
+                let rows = std::array::from_fn(|i| {
+                    let from = reflect((2 * y) as isize + i as isize - 2, h) * w;
+                    &s[from + lo..from + hi]
+                });
+                self.pyramid.reduce_vertical(&rows, tmp);
+                let row = &mut d[y * dst.w..(y + 1) * dst.w];
+                let border = |x: usize| {
+                    let xx = (2 * x) as isize;
                     let t = |i: isize| tmp[reflect(i, w) - lo];
-                    *d = 0.05 * (t(xx - 2) + t(xx + 2))
-                        + 0.25 * (t(xx - 1) + t(xx + 1))
-                        + 0.4 * t(xx);
+                    0.05 * (t(xx - 2) + t(xx + 2)) + 0.25 * (t(xx - 1) + t(xx + 1)) + 0.4 * t(xx)
+                };
+                if out.x0 == 0 {
+                    row[0] = border(0);
+                }
+                if start < end {
+                    self.pyramid
+                        .reduce_horizontal(&tmp[2 * start - 2 - lo..], &mut row[start..end]);
+                }
+                for (x, d) in row
+                    .iter_mut()
+                    .enumerate()
+                    .take(out.x1)
+                    .skip(out.x0.max(end))
+                {
+                    *d = border(x);
                 }
             }
         }
@@ -492,6 +575,16 @@ impl IncrementalState {
 
     /// Re-pool every tile of level `k` inside the tile-aligned `tiles`.
     fn pool_region(&mut self, reference: &PreparedReference, k: usize, tiles: Rect) {
+        for y0 in (tiles.y0..tiles.y1).step_by(POOL_ROWS) {
+            self.pool_strip(
+                reference,
+                k,
+                Rect::new(tiles.x0, y0, tiles.x1, (y0 + POOL_ROWS).min(tiles.y1)),
+            );
+        }
+    }
+
+    fn pool_strip(&mut self, reference: &PreparedReference, k: usize, tiles: Rect) {
         if tiles.is_empty() {
             return;
         }
@@ -507,116 +600,114 @@ impl IncrementalState {
         let (aw, ah) = (area.width(), area.height());
         let band = &reference.bands[k];
         let s = &mut self.scratch;
-        for c in 0..3 {
-            for v in [&mut s.expanded[c], &mut s.contrast[c], &mut s.mask[c]] {
-                v.resize(aw * ah, 0.0);
-            }
+        for plane in s
+            .expanded
+            .iter_mut()
+            .chain(&mut s.contrast)
+            .chain(&mut s.mask)
+        {
+            ensure_len(plane, aw * ah);
         }
-        expand_region(&self.levels[k + 1], w, h, area, &mut s.expanded, &mut s.tmp);
+        expand_region(
+            &self.levels[k + 1],
+            w,
+            h,
+            area,
+            &mut s.expanded,
+            &mut s.tmp,
+            &self.pyramid,
+        );
         let level = &self.levels[k];
-        for c in 0..3 {
-            for y in area.y0..area.y1 {
-                let at = (y - area.y0) * aw;
-                s.contrast[c][at..at + aw]
-                    .copy_from_slice(&level.gauss[c][y * w + area.x0..][..aw]);
-            }
-        }
         let scale = if k == 0 { 1.0 } else { 2.0 };
-        for y in 0..ah {
-            let span = y * aw..(y + 1) * aw;
-            let src = (area.y0 + y) * w + area.x0;
-            let [t0, t1, t2] = &mut s.contrast;
-            let [m0, m1, m2] = &mut s.mask;
-            kernels::contrast(
-                self.backend,
-                [
-                    &mut t0[span.clone()],
-                    &mut t1[span.clone()],
-                    &mut t2[span.clone()],
-                ],
-                s.expanded.each_ref().map(|v| &v[span.clone()]),
-                band.sensitivity.each_ref().map(|v| &v[src..src + aw]),
-                band.contrast.each_ref().map(|v| &v[src..src + aw]),
-                [
-                    &mut m0[span.clone()],
-                    &mut m1[span.clone()],
-                    &mut m2[span.clone()],
-                ],
+        let src = area.y0 * w + area.x0;
+        kernels::contrast_region(
+            self.backend,
+            kernels::ContrastRegion {
+                current: level.gauss.each_ref().map(|v| &v[src..]),
+                expanded: s.expanded.each_ref().map(|v| &v[..aw * ah]),
+                sensitivity: band.sensitivity.each_ref().map(|v| &v[src..]),
+                reference: band.contrast.each_ref().map(|v| &v[src..]),
+                contrast: s.contrast.each_mut().map(|v| &mut v[..aw * ah]),
+                mask: s.mask.each_mut().map(|v| &mut v[..aw * ah]),
+                width: aw,
+                height: ah,
+                source_stride: w,
                 scale,
-            );
-        }
+            },
+        );
         // Blurred masks over the tiles (exclusive reflection at image edges).
         let (tw, th) = (tiles.width(), tiles.height());
         for plane in &mut s.blurred {
-            plane.resize(tw * th, 0.0);
+            ensure_len(plane, tw * th);
         }
+        // Expansion is dead after contrast conversion; reuse its storage for
+        // the horizontal blur rather than retaining another three planes.
+        let horizontal = &mut s.expanded;
         if blur {
             let rows = tiles.grow(RADIUS, w, h);
             // Every source row a vertical tap can read lies inside `rows`.
             let at = |x: usize, y: usize| (y - area.y0) * aw + x - area.x0;
-            for c in 0..3 {
-                s.horizontal[c].resize(rows.height() * tw, 0.0);
+            for ((mask, horizontal), blurred) in s.mask.iter().zip(horizontal).zip(&mut s.blurred) {
+                ensure_len(horizontal, rows.height() * tw);
                 let interior = tiles.x0 >= RADIUS && tiles.x1 + RADIUS <= w;
                 for y in rows.y0..rows.y1 {
-                    s.padded.clear();
-                    if interior {
-                        let from = at(tiles.x0 - RADIUS, y);
-                        s.padded
-                            .extend_from_slice(&s.mask[c][from..from + tw + 2 * RADIUS]);
-                    } else {
+                    if !interior {
+                        s.padded.clear();
                         for i in 0..tw + 2 * RADIUS {
                             let x = reflect_exclusive(
                                 tiles.x0 as isize + i as isize - RADIUS as isize,
                                 w,
                             );
-                            s.padded.push(s.mask[c][at(x, y)]);
+                            s.padded.push(mask[at(x, y)]);
                         }
                     }
-                    let dst = &mut s.horizontal[c][(y - rows.y0) * tw..][..tw];
-                    self.blur.horizontal_row(&s.padded, dst);
+                    let dst = &mut horizontal[(y - rows.y0) * tw..][..tw];
+                    if interior {
+                        let from = at(tiles.x0 - RADIUS, y);
+                        self.blur
+                            .horizontal_row(&mask[from..from + tw + 2 * RADIUS], dst);
+                    } else {
+                        self.blur.horizontal_row(&s.padded, dst);
+                    }
                 }
                 for y in tiles.y0..tiles.y1 {
                     let src: blur::BlurRows<'_> = std::array::from_fn(|i| {
                         let sy = reflect_exclusive(y as isize + i as isize - RADIUS as isize, h);
-                        &s.horizontal[c][(sy - rows.y0) * tw..][..tw]
+                        &horizontal[(sy - rows.y0) * tw..][..tw]
                     });
-                    let dst = &mut s.blurred[c][(y - tiles.y0) * tw..][..tw];
+                    let dst = &mut blurred[(y - tiles.y0) * tw..][..tw];
                     self.blur.vertical_row(&src, dst);
                 }
             }
         } else {
-            for c in 0..3 {
+            for (mask, blurred) in s.mask.iter().zip(&mut s.blurred) {
                 for y in tiles.y0..tiles.y1 {
                     let from = (y - area.y0) * aw + tiles.x0 - area.x0;
-                    s.blurred[c][(y - tiles.y0) * tw..][..tw]
-                        .copy_from_slice(&s.mask[c][from..from + tw]);
+                    blurred[(y - tiles.y0) * tw..][..tw].copy_from_slice(&mask[from..from + tw]);
                 }
             }
         }
-        // Pool each tile in row segments (aligned, so SIMD lanes never move).
+        // Batch the strip with one validation/dispatch and no staging buffer.
+        // Individual row reductions still start at the same tile boundary.
         let level = &mut self.levels[k];
+        let c_at = (tiles.y0 - area.y0) * aw + tiles.x0 - area.x0;
+        let r_at = tiles.y0 * w + tiles.x0;
+        let t_at = tiles.y0 / TILE * level.tiles_x + tiles.x0 / TILE;
+        kernels::pool_tiles(
+            self.backend,
+            &kernels::TiledPool {
+                current: s.contrast.each_ref().map(|v| &v[c_at..]),
+                reference: band.contrast.each_ref().map(|v| &v[r_at..]),
+                blurred: s.blurred.each_ref().map(|v| v.as_slice()),
+                strides: [aw, w, tw],
+                width: tw,
+                height: th,
+                parameters: self.params,
+            },
+            &mut level.tiles[t_at..],
+            level.tiles_x,
+        );
         for ty in tiles.y0 / TILE..tiles.y1.div_ceil(TILE) {
-            for tx in tiles.x0 / TILE..tiles.x1.div_ceil(TILE) {
-                let (x0, x1) = (tx * TILE, ((tx + 1) * TILE).min(w));
-                let mut sums = [0.0f64; 3];
-                for y in ty * TILE..((ty + 1) * TILE).min(h) {
-                    let c_at = (y - area.y0) * aw + x0 - area.x0;
-                    let b_at = (y - tiles.y0) * tw + x0 - tiles.x0;
-                    let r_at = y * w + x0;
-                    let n = x1 - x0;
-                    let part = kernels::pool(
-                        self.backend,
-                        s.contrast.each_ref().map(|v| &v[c_at..c_at + n]),
-                        band.contrast.each_ref().map(|v| &v[r_at..r_at + n]),
-                        s.blurred.each_ref().map(|v| &v[b_at..b_at + n]),
-                        self.params,
-                    );
-                    for c in 0..3 {
-                        sums[c] += part[c];
-                    }
-                }
-                level.tiles[ty * level.tiles_x + tx] = sums;
-            }
             level.sum_tile_row(ty);
         }
     }
@@ -627,11 +718,15 @@ impl IncrementalState {
         let count = level.w * level.h;
         let bg = model::mean_luminance(&level.gauss[0][..count]);
         let mut sums = [0.0_f64; 3];
-        for (c, sum) in sums.iter_mut().enumerate() {
-            let sensitivity = band.sensitivity[c][0];
-            for i in 0..count {
-                let d = ((level.gauss[c][i] / bg).min(1000.0) * sensitivity - band.contrast[c][i])
-                    .abs() as f64;
+        for (((sum, gauss), sensitivity), contrast) in sums
+            .iter_mut()
+            .zip(&level.gauss)
+            .zip(&band.sensitivity)
+            .zip(&band.contrast)
+        {
+            let sensitivity = sensitivity[0];
+            for (&value, &reference) in gauss[..count].iter().zip(&contrast[..count]) {
+                let d = ((value / bg).min(1000.0) * sensitivity - reference).abs() as f64;
                 *sum += d * d + 2.0 * (EPSILON as f64) * d;
             }
         }
@@ -647,35 +742,53 @@ fn expand_region(
     area: Rect,
     out: &mut [Vec<f32>; 3],
     tmp: &mut Vec<f32>,
+    kernels: &pyramid::Kernels,
 ) {
     let (sw, sh) = (coarse.w, coarse.h);
     debug_assert_eq!((sw, sh), (w.div_ceil(2), h.div_ceil(2)));
     let cx0 = (area.x0 / 2).saturating_sub(1);
     let cx1 = ((area.x1 - 1) / 2 + 2).min(sw);
     let aw = area.width();
-    tmp.resize(sw, 0.0);
+    ensure_len(tmp, cx1 - cx0);
+    let tmp = &mut tmp[..cx1 - cx0];
+    let start = (area.x0 / 2).max(1);
+    let end = (area.x1 / 2).min(sw - 1);
     for (src, plane) in coarse.gauss.iter().zip(out.iter_mut()) {
         for y in area.y0..area.y1 {
             let sy = y / 2;
-            let before = sy.saturating_sub(1) * sw;
-            let center = sy * sw;
-            let after = (sy + 1).min(sh - 1) * sw;
-            for cx in cx0..cx1 {
-                tmp[cx] = if y % 2 == 0 {
-                    0.1 * (src[before + cx] + src[after + cx]) + 0.8 * src[center + cx]
-                } else {
-                    0.5 * (src[center + cx] + src[after + cx])
-                };
+            let rows = [sy.saturating_sub(1), sy, (sy + 1).min(sh - 1)]
+                .map(|r| &src[r * sw + cx0..r * sw + cx1]);
+            if y.is_multiple_of(2) {
+                kernels.expand_even(&rows, tmp);
+            } else {
+                kernels.expand_odd(&[rows[1], rows[2]], tmp);
             }
             let row = &mut plane[(y - area.y0) * aw..][..aw];
-            for (x, d) in (area.x0..area.x1).zip(row.iter_mut()) {
+            let border = |x: usize| {
                 let sx = x / 2;
                 let next = (sx + 1).min(sw - 1);
-                *d = if x % 2 == 0 {
-                    0.1 * (tmp[sx.saturating_sub(1)] + tmp[next]) + 0.8 * tmp[sx]
+                if x.is_multiple_of(2) {
+                    0.1 * (tmp[sx.saturating_sub(1) - cx0] + tmp[next - cx0]) + 0.8 * tmp[sx - cx0]
                 } else {
-                    0.5 * (tmp[sx] + tmp[next])
-                };
+                    0.5 * (tmp[sx - cx0] + tmp[next - cx0])
+                }
+            };
+            // area.x0 is aligned to ALIGN, so every interior span starts on
+            // an even pixel. Only image edges need clamped coarse samples.
+            if area.x0 == 0 {
+                for (x, d) in row.iter_mut().enumerate().take(2) {
+                    *d = border(x);
+                }
+            }
+            if start < end {
+                kernels.expand_horizontal(
+                    &tmp[start - 1 - cx0..],
+                    &mut row[2 * start - area.x0..2 * end - area.x0],
+                );
+            }
+            let tail = (2 * end).max(area.x0);
+            for (x, d) in (tail..area.x1).zip(&mut row[tail - area.x0..]) {
+                *d = border(x);
             }
         }
     }
