@@ -172,6 +172,7 @@ pub(crate) fn pool_avx2(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and AVX2 availability.
     vector::pool::<Avx2>(data)
 }
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub(crate) fn pool_tiles_avx2(
     data: &crate::kernels::TiledPool<'_>,
@@ -180,6 +181,15 @@ pub(crate) fn pool_tiles_avx2(
 ) {
     // Dispatch validates all strip strides, output lengths and AVX2 availability.
     vector::pool_tiles::<Avx2>(data, tiles, stride);
+}
+#[target_feature(enable = "avx2")]
+pub(crate) fn pool_parts_avx2(
+    data: &crate::kernels::TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates the strip strides, output length and CPU availability.
+    vector::pool_parts::<Avx2>(data, parts, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "avx2")]

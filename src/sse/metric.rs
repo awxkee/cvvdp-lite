@@ -174,6 +174,7 @@ pub(crate) fn pool_sse2(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and SSE2 availability.
     vector::pool::<Sse2>(data)
 }
+#[cfg(test)]
 #[target_feature(enable = "sse2")]
 pub(crate) fn pool_tiles_sse2(
     data: &crate::kernels::TiledPool<'_>,
@@ -182,6 +183,15 @@ pub(crate) fn pool_tiles_sse2(
 ) {
     // Dispatch validates all strip strides, output lengths and SSE2 availability.
     vector::pool_tiles::<Sse2>(data, tiles, stride);
+}
+#[target_feature(enable = "sse2")]
+pub(crate) fn pool_parts_sse2(
+    data: &crate::kernels::TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates the strip strides, output length and CPU availability.
+    vector::pool_parts::<Sse2>(data, parts, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "sse2")]

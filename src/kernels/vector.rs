@@ -201,10 +201,25 @@ pub(crate) fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
     pool_with_powers::<V>(data, power_tables())
 }
 
+#[cfg(test)]
 #[inline(always)]
 pub(crate) fn pool_tiles<V: Vector>(data: &TiledPool<'_>, tiles: &mut [[f64; 3]], stride: usize) {
     let powers = power_tables();
     super::pool_tiles_with(data, tiles, stride, |row| {
+        let (done, mut squares) = pool_with_powers::<V>(row, powers);
+        super::pool_scalar_tail(row, done, &mut squares);
+        squares
+    });
+}
+
+#[inline(always)]
+pub(crate) fn pool_parts<V: Vector>(
+    data: &TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    parts_stride: usize,
+) {
+    let powers = power_tables();
+    super::pool_parts_with(data, parts, parts_stride, |row| {
         let (done, mut squares) = pool_with_powers::<V>(row, powers);
         super::pool_scalar_tail(row, done, &mut squares);
         squares

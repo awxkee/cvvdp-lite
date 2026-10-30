@@ -348,6 +348,8 @@ fn pool_scalar_tail(data: &Pool<'_>, done: usize, squares: &mut [f64; 3]) {
 
 /// Dispatch and validate once for a whole strip, writing directly into the
 /// existing tile cache. Row reductions and scalar tails stay tile-local.
+/// Incremental pooling uses [`pool_row_parts`]; this is its test oracle.
+#[cfg(test)]
 #[allow(unused_unsafe)]
 pub(crate) fn pool_tiles(
     backend: Backend,
@@ -399,6 +401,81 @@ pub(crate) fn pool_tiles(
     });
 }
 
+/// Per-row terms of a strip: `parts[y * parts_stride + t]` receives exactly
+/// the term [`pool_tiles`] adds for row `y` into tile `t`, so callers can keep
+/// row terms and re-add them in row order.
+#[allow(unused_unsafe)]
+pub(crate) fn pool_row_parts(
+    backend: Backend,
+    data: &TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    parts_stride: usize,
+) {
+    assert!(backend.is_available());
+    assert!(data.width > 0 && data.height > 0);
+    for (planes, stride) in [data.current, data.reference, data.blurred]
+        .iter()
+        .zip(data.strides)
+    {
+        let required = (data.height - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(data.width))
+            .expect("pool input size overflow");
+        assert!(stride >= data.width || data.height == 1);
+        assert!(planes.iter().all(|plane| plane.len() >= required));
+    }
+    let columns = data.width.div_ceil(POOL_TILE);
+    assert!(parts_stride >= columns || data.height == 1);
+    assert!(parts.len() >= (data.height - 1) * parts_stride + columns);
+    // SAFETY: Every input covers the row segment, the output covers every
+    // tile, and only CPU-supported entries are called.
+    unsafe {
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+        if backend == Backend::Neon {
+            return crate::neon::pool_parts_neon(data, parts, parts_stride);
+        }
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Avx2 {
+            return crate::avx::pool_parts_avx2(data, parts, parts_stride);
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Sse2 {
+            return crate::sse::pool_parts_sse2(data, parts, parts_stride);
+        }
+    }
+    pool_parts_with(data, parts, parts_stride, |row| {
+        let mut squares = [0.0; 3];
+        pool_scalar_tail(row, 0, &mut squares);
+        squares
+    });
+}
+
+/// Row terms of [`pool_tiles_with`], one output row per strip row.
+#[inline]
+fn pool_parts_with(
+    data: &TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    parts_stride: usize,
+    mut pool_row: impl FnMut(&Pool<'_>) -> [f64; 3],
+) {
+    let columns = data.width.div_ceil(POOL_TILE);
+    for y in 0..data.height {
+        let out = &mut parts[y * parts_stride..][..columns];
+        for (part, x0) in out.iter_mut().zip((0..data.width).step_by(POOL_TILE)) {
+            let n = POOL_TILE.min(data.width - x0);
+            let [c, r, b] = data.strides.map(|stride| y * stride + x0);
+            let row = Pool {
+                current: data.current.map(|v| &v[c..c + n]),
+                reference: data.reference.map(|v| &v[r..r + n]),
+                blurred: data.blurred.map(|v| &v[b..b + n]),
+                parameters: data.parameters,
+            };
+            *part = pool_row(&row);
+        }
+    }
+}
+
+#[cfg(test)]
 #[inline]
 fn pool_tiles_with(
     data: &TiledPool<'_>,

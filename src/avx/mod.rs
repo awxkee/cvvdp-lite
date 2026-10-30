@@ -32,11 +32,13 @@ mod image;
 mod metric;
 mod pyramid;
 
-pub(crate) use blur::{blur_horizontal_avx2, blur_vertical_avx2};
+pub(crate) use blur::{blur_horizontal_avx2, blur_vertical_avx2, blur_vertical_region_avx2};
 pub(crate) use image::{dkl_bytes_avx2, dkl_linear_avx2};
 #[cfg(test)]
+pub(crate) use metric::pool_tiles_avx2;
+#[cfg(test)]
 pub(crate) use metric::powers_avx2;
-pub(crate) use metric::{contrast_avx2, contrast_region_avx2, pool_avx2, pool_tiles_avx2};
+pub(crate) use metric::{contrast_avx2, contrast_region_avx2, pool_avx2, pool_parts_avx2};
 pub(crate) use pyramid::{
     expand_even_avx2, expand_horizontal_avx2, expand_odd_avx2, reduce_horizontal_avx2,
     reduce_vertical_avx2,
