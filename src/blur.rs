@@ -35,11 +35,17 @@ use crate::{Backend, pyramid::ensure_len};
 pub(crate) const RADIUS: usize = 6;
 pub(crate) const WINDOW: usize = 2 * RADIUS + 1;
 pub(crate) type BlurRows<'a> = [&'a [f32]; WINDOW];
+/// Most output rows one [`GaussianBlur::vertical_rows`] call takes.
+pub(crate) const VERTICAL_BATCH: usize = 32;
+/// Whole-region vertical pass from row pointers; see `blur_vertical_region_neon`.
+type VerticalRegionFn = unsafe fn(&[*const f32], &[f32; WINDOW], usize, *mut f32, usize);
 
 #[derive(Clone, Copy)]
 struct Kernels {
     horizontal: fn(&[f32], &[f32; WINDOW], &mut [f32]) -> usize,
     vertical: fn(&BlurRows<'_>, &[f32; WINDOW], &mut [f32]) -> usize,
+    /// Optional region kernel for batched vertical passes (≥ 4 columns).
+    vertical_region: Option<VerticalRegionFn>,
 }
 
 impl Kernels {
@@ -53,20 +59,24 @@ impl Kernels {
             Backend::Neon => Self {
                 horizontal: |s, k, d| unsafe { crate::neon::blur_horizontal_neon(s, k, d) },
                 vertical: |s, k, d| unsafe { crate::neon::blur_vertical_neon(s, k, d) },
+                vertical_region: Some(crate::neon::blur_vertical_region_neon),
             },
             #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
             Backend::Avx2 => Self {
                 horizontal: |s, k, d| unsafe { crate::avx::blur_horizontal_avx2(s, k, d) },
                 vertical: |s, k, d| unsafe { crate::avx::blur_vertical_avx2(s, k, d) },
+                vertical_region: Some(crate::avx::blur_vertical_region_avx2),
             },
             #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
             Backend::Sse2 => Self {
                 horizontal: |s, k, d| unsafe { crate::sse::blur_horizontal_sse2(s, k, d) },
                 vertical: |s, k, d| unsafe { crate::sse::blur_vertical_sse2(s, k, d) },
+                vertical_region: Some(crate::sse::blur_vertical_region_sse2),
             },
             Backend::Scalar => Self {
                 horizontal: |_, _, _| 0,
                 vertical: |_, _, _| 0,
+                vertical_region: None,
             },
             #[allow(unreachable_patterns)]
             _ => unreachable!("unavailable backend rejected above"),
@@ -115,6 +125,47 @@ impl GaussianBlur {
         if done < dst.len() {
             let tail = rows.map(|row| &row[done..]);
             vertical_scalar(&tail, &self.kernel, &mut dst[done..]);
+        }
+    }
+
+    /// Vertical pass over a batch of rows: output row `y` reads
+    /// `rows[y..y + WINDOW]` (each starting at the first output column) and
+    /// goes to `out[y * out_stride..][..width]`.
+    pub(crate) fn vertical_rows(
+        &self,
+        rows: &[&[f32]],
+        width: usize,
+        out: &mut [f32],
+        out_stride: usize,
+    ) {
+        assert!(rows.len() > 2 * RADIUS && rows.len() <= VERTICAL_BATCH + 2 * RADIUS);
+        assert!(rows.iter().all(|row| row.len() >= width));
+        let outputs = rows.len() - 2 * RADIUS;
+        assert!(out_stride >= width && out.len() >= (outputs - 1) * out_stride + width);
+        if let Some(region) = self.kernels.vertical_region
+            && width >= 4
+        {
+            let mut pointers = [std::ptr::null::<f32>(); VERTICAL_BATCH + 2 * RADIUS];
+            for (pointer, row) in pointers.iter_mut().zip(rows) {
+                *pointer = row.as_ptr();
+            }
+            // SAFETY: every row holds `width` samples and `out` every output
+            // row at `out_stride` (asserted above); the kernel needs NEON,
+            // which selected it.
+            unsafe {
+                region(
+                    &pointers[..rows.len()],
+                    &self.kernel,
+                    width,
+                    out.as_mut_ptr(),
+                    out_stride,
+                );
+            }
+            return;
+        }
+        for y in 0..outputs {
+            let window: BlurRows<'_> = std::array::from_fn(|i| &rows[y + i][..width]);
+            self.vertical_row(&window, &mut out[y * out_stride..][..width]);
         }
     }
 
@@ -292,6 +343,51 @@ mod tests {
                     assert!(plane.iter().all(|&v| v == 3.0));
                 } else {
                     assert!(plane.iter().all(|&v| (v - 3.0).abs() < 0.000002));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_kernels_match_per_row_vertical_bit_exactly() {
+        const GUARD: f32 = -12345.0;
+        let k = kernel();
+        for backend in [Backend::Scalar, Backend::Neon, Backend::Sse2, Backend::Avx2] {
+            if !backend.is_available() {
+                continue;
+            }
+            let Some(region) = Kernels::for_backend(backend).vertical_region else {
+                continue;
+            };
+            for width in 4..=40 {
+                for outputs in 1..=VERTICAL_BATCH {
+                    let count = outputs + 2 * RADIUS;
+                    let source: Vec<Vec<f32>> = (0..count)
+                        .map(|j| {
+                            (0..width + 3)
+                                .map(|i| ((i * 31 + j * 17 + width) % 97) as f32 / 13.0)
+                                .collect()
+                        })
+                        .collect();
+                    let rows: Vec<*const f32> =
+                        source.iter().map(|row| row[3..].as_ptr()).collect();
+                    let out_stride = width + 2;
+                    let len = (outputs - 1) * out_stride + width + 1;
+                    let mut actual = vec![GUARD; len];
+                    // SAFETY: every row holds `width` samples, the output every
+                    // row at `out_stride`; the kernel came from CPU-checked dispatch.
+                    unsafe { region(&rows, &k, width, actual.as_mut_ptr(), out_stride) };
+                    let mut expected = vec![GUARD; len];
+                    for y in 0..outputs {
+                        let window: BlurRows<'_> =
+                            std::array::from_fn(|i| &source[y + i][3..3 + width]);
+                        vertical_scalar(&window, &k, &mut expected[y * out_stride..][..width]);
+                    }
+                    assert_eq!(
+                        actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "{backend:?} width={width} outputs={outputs}"
+                    );
                 }
             }
         }

@@ -40,7 +40,7 @@
 //! sequence of updates hold bit-identical sums. Scores agree with
 //! [`crate::Workspace::compare`] to rounding (a different summation order).
 
-use crate::blur::{self, GaussianBlur, RADIUS};
+use crate::blur::{GaussianBlur, RADIUS, VERTICAL_BATCH};
 use crate::image::RgbToDkl;
 use crate::kernels::{self, EPSILON, MaskParameters};
 use crate::model::{self, PreparedReference};
@@ -50,8 +50,9 @@ use crate::{Backend, Error, RgbImage, Score};
 const TILE: usize = kernels::POOL_TILE;
 const ALIGN: usize = 8;
 // Keep temporary images independent of image height. Whole tile rows preserve
-// the SIMD lane placement and summation order of every pooled tile.
-const POOL_ROWS: usize = 64;
+// the SIMD lane placement and summation order of every pooled tile. A strip's
+// rows, and its masks' vertical reach, also fit the row caches at once.
+const POOL_ROWS: usize = 32;
 
 /// A half-open pixel rectangle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,7 +185,140 @@ fn blur_active(w: usize, h: usize) -> bool {
     w > RADIUS && h > RADIUS
 }
 
+/// Slots of the row caches. One vertical batch reads `VERTICAL_BATCH + 2·RADIUS`
+/// mask rows; one re-pooled block of tiles stays resident across updates.
+const ROW_SLOTS: usize = 48;
+const _: () = assert!(
+    VERTICAL_BATCH + 2 * RADIUS <= ROW_SLOTS
+        && POOL_ROWS <= VERTICAL_BATCH
+        && POOL_ROWS.is_multiple_of(TILE)
+);
+
+/// Per-row values of one level for a band of recent rows: slot
+/// `y % ROW_SLOTS` holds row `y`, valid over one interval of columns.
+/// Callers invalidate rows whose inputs changed; everything else is reused,
+/// so a scan in raster order computes each halo row about once instead of
+/// once per update. Every value is a function of its own row and column, so
+/// reused and recomputed entries are bit-identical.
+struct RowCache<T> {
+    width: usize,
+    /// `ROW_SLOTS` rows of `width` values (empty when unused).
+    data: Vec<T>,
+    /// Row held by each slot (`usize::MAX` for none).
+    row: [usize; ROW_SLOTS],
+    /// Valid columns of each slot.
+    valid: [(usize, usize); ROW_SLOTS],
+}
+
+impl<T: Copy + Default> RowCache<T> {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            data: vec![T::default(); ROW_SLOTS * width],
+            row: [usize::MAX; ROW_SLOTS],
+            valid: [(0, 0); ROW_SLOTS],
+        }
+    }
+
+    /// Forget rows whose inputs changed.
+    fn invalidate(&mut self, rows: std::ops::Range<usize>) {
+        for y in rows {
+            let slot = y % ROW_SLOTS;
+            if self.row[slot] == y {
+                self.row[slot] = usize::MAX;
+            }
+        }
+    }
+
+    /// Compute whatever part of `columns` of row `y` the cache lacks;
+    /// `compute(range, row)` writes `row[range]`.
+    fn fill(
+        &mut self,
+        y: usize,
+        columns: std::ops::Range<usize>,
+        mut compute: impl FnMut(std::ops::Range<usize>, &mut [T]),
+    ) {
+        let slot = y % ROW_SLOTS;
+        if self.row[slot] != y {
+            self.row[slot] = y;
+            self.valid[slot] = (0, 0);
+        }
+        let (a, b) = self.valid[slot];
+        let dst = &mut self.data[slot * self.width..(slot + 1) * self.width];
+        if a < b && columns.start <= b && a <= columns.end {
+            // Overlapping or adjacent: extend the valid interval.
+            if columns.start < a {
+                compute(columns.start..a, dst);
+            }
+            if b < columns.end {
+                compute(b..columns.end, dst);
+            }
+            self.valid[slot] = (a.min(columns.start), b.max(columns.end));
+        } else {
+            compute(columns.clone(), dst);
+            self.valid[slot] = (columns.start, columns.end);
+        }
+    }
+
+    /// [`fill`](Self::fill) for each of `rows`, except that runs of rows
+    /// holding nothing usable are computed together: `block(run, out,
+    /// stride)` writes `columns` of row `run.start + i` at
+    /// `out[i * stride..]`, one call per run of consecutive slots.
+    fn fill_rows(
+        &mut self,
+        rows: std::ops::Range<usize>,
+        columns: std::ops::Range<usize>,
+        mut block: impl FnMut(std::ops::Range<usize>, &mut [T], usize),
+        mut single: impl FnMut(usize, std::ops::Range<usize>, &mut [T]),
+    ) {
+        let cold = |cache: &Self, y: usize| {
+            let slot = y % ROW_SLOTS;
+            let (a, b) = cache.valid[slot];
+            cache.row[slot] != y || a >= b || columns.start > b || a > columns.end
+        };
+        let mut y = rows.start;
+        while y < rows.end {
+            if !cold(self, y) {
+                self.fill(y, columns.clone(), |range, row| single(y, range, row));
+                y += 1;
+                continue;
+            }
+            // A run of cold rows in consecutive slots (no wrap).
+            let start = y;
+            while y < rows.end && cold(self, y) && (y == start || !y.is_multiple_of(ROW_SLOTS)) {
+                let slot = y % ROW_SLOTS;
+                self.row[slot] = y;
+                self.valid[slot] = (columns.start, columns.end);
+                y += 1;
+            }
+            let at = start % ROW_SLOTS * self.width + columns.start;
+            block(start..y, &mut self.data[at..], self.width);
+        }
+    }
+
+    /// Whether row `y` is cached over all of `columns`.
+    fn covers(&self, y: usize, columns: std::ops::Range<usize>) -> bool {
+        let slot = y % ROW_SLOTS;
+        let (a, b) = self.valid[slot];
+        self.row[slot] == y && a <= columns.start && columns.end <= b
+    }
+
+    fn row(&self, y: usize) -> &[T] {
+        let slot = y % ROW_SLOTS;
+        debug_assert_eq!(self.row[slot], y);
+        &self.data[slot * self.width..(slot + 1) * self.width]
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.data.capacity() * std::mem::size_of::<T>()
+    }
+}
+
 struct Level {
+    /// Horizontally blurred mask rows near recent updates, per channel.
+    masks: [RowCache<f32>; 3],
+    /// Pooled row terms per tile column near recent updates.
+    parts: RowCache<[f64; 3]>,
     w: usize,
     h: usize,
     /// Test Gaussian level (DKL planes).
@@ -248,6 +382,10 @@ pub struct Checkpoint {
     gauss: Vec<(usize, Rect)>,
     gauss_data: Vec<f32>,
     tiles: Vec<(usize, usize, [f64; 3])>,
+    /// Rows per level whose blurred masks the update changed.
+    masks: Vec<(usize, usize, usize)>,
+    /// Rows per level whose pooled terms the update changed.
+    parts: Vec<(usize, usize, usize)>,
     base: [f64; 3],
 }
 
@@ -257,6 +395,8 @@ impl Checkpoint {
         self.gauss.capacity() * std::mem::size_of::<(usize, Rect)>()
             + self.gauss_data.capacity() * std::mem::size_of::<f32>()
             + self.tiles.capacity() * std::mem::size_of::<(usize, usize, [f64; 3])>()
+            + (self.masks.capacity() + self.parts.capacity())
+                * std::mem::size_of::<(usize, usize, usize)>()
     }
 }
 
@@ -291,6 +431,12 @@ impl IncrementalState {
                         .sum::<usize>()
                         + (level.tiles.capacity() + level.row_sums.capacity())
                             * std::mem::size_of::<[f64; 3]>()
+                        + level
+                            .masks
+                            .iter()
+                            .map(RowCache::allocated_bytes)
+                            .sum::<usize>()
+                        + level.parts.allocated_bytes()
                 })
                 .sum::<usize>()
             + scratch
@@ -336,7 +482,14 @@ impl IncrementalState {
                 } else {
                     tiles_x * band.h.div_ceil(TILE)
                 };
+                let blurred = if blur_active(band.w, band.h) {
+                    band.w
+                } else {
+                    0
+                };
                 Level {
+                    masks: std::array::from_fn(|_| RowCache::new(blurred)),
+                    parts: RowCache::new(if n_tiles == 0 { 0 } else { tiles_x }),
                     w: band.w,
                     h: band.h,
                     gauss: std::array::from_fn(|_| vec![0.0; band.w * band.h]),
@@ -415,6 +568,8 @@ impl IncrementalState {
         checkpoint.gauss.clear();
         checkpoint.gauss_data.clear();
         checkpoint.tiles.clear();
+        checkpoint.masks.clear();
+        checkpoint.parts.clear();
         checkpoint.base = self.base;
         self.apply(reference, test, rect, Some(checkpoint))?;
         Ok(self.score())
@@ -447,6 +602,15 @@ impl IncrementalState {
                 level.sum_tile_row(ty);
                 previous = Some((k, ty));
             }
+        }
+        // The restored masks differ from the cached rows the update filtered.
+        for &(k, y0, y1) in &checkpoint.masks {
+            for masks in &mut self.levels[k].masks {
+                masks.invalidate(y0..y1);
+            }
+        }
+        for &(k, y0, y1) in &checkpoint.parts {
+            self.levels[k].parts.invalidate(y0..y1);
         }
         self.base = checkpoint.base;
     }
@@ -504,11 +668,25 @@ impl IncrementalState {
             self.save_gauss(&mut checkpoint, k + 1, coarse);
             self.reduce_region(k, coarse);
             let changed = dirty.union(expand_footprint(coarse, w, h));
+            if blur_active(w, h) {
+                // Masks follow contrast, which changed only within `changed`.
+                for masks in &mut self.levels[k].masks {
+                    masks.invalidate(changed.y0..changed.y1);
+                }
+                if let Some(cp) = checkpoint.as_deref_mut() {
+                    cp.masks.push((k, changed.y0, changed.y1));
+                }
+            }
             let pooled = if blur_active(w, h) {
                 changed.grow(RADIUS, w, h)
             } else {
                 changed
             };
+            // Pooled terms change wherever contrast or blurred masks do.
+            self.levels[k].parts.invalidate(pooled.y0..pooled.y1);
+            if let Some(cp) = checkpoint.as_deref_mut() {
+                cp.parts.push((k, pooled.y0, pooled.y1));
+            }
             let tiles = pooled.align_tiles(w, h);
             if let Some(cp) = checkpoint.as_deref_mut() {
                 let level = &self.levels[k];
@@ -588,15 +766,71 @@ impl IncrementalState {
         if tiles.is_empty() {
             return;
         }
+        let h = self.levels[k].h;
+        let (tx0, tx1) = (tiles.x0 / TILE, tiles.x1.div_ceil(TILE));
+        let level = &self.levels[k];
+        // Rows whose pooled terms are missing: every row the update changed
+        // (invalidated in `apply`) plus rows never pooled over these tiles.
+        let missing = |y: usize| !level.parts.covers(y, tx0..tx1);
+        if let Some(first) = (tiles.y0..tiles.y1).find(|&y| missing(y)) {
+            let last = (first..tiles.y1)
+                .rev()
+                .find(|&y| missing(y))
+                .unwrap_or(first)
+                + 1;
+            self.pool_rows(reference, k, tiles, first..last);
+        }
+        // Re-add every tile's row terms in row order, as `pool_tiles` does.
+        let level = &mut self.levels[k];
+        for ty in tiles.y0 / TILE..tiles.y1.div_ceil(TILE) {
+            let rows = ty * TILE..((ty + 1) * TILE).min(h);
+            for tx in tx0..tx1 {
+                let mut sums = [0.0f64; 3];
+                for y in rows.clone() {
+                    for (sum, value) in sums.iter_mut().zip(level.parts.row(y)[tx]) {
+                        *sum += value;
+                    }
+                }
+                level.tiles[ty * level.tiles_x + tx] = sums;
+            }
+            level.sum_tile_row(ty);
+        }
+    }
+
+    /// Recompute the missing pooled terms of `pool` rows over `tiles`
+    /// columns, deriving contrast and masks only for the rows that need them.
+    fn pool_rows(
+        &mut self,
+        reference: &PreparedReference,
+        k: usize,
+        tiles: Rect,
+        pool: std::ops::Range<usize>,
+    ) {
         let (w, h) = (self.levels[k].w, self.levels[k].h);
         let blur = blur_active(w, h);
-        // Contrast and masks over the tiles plus the blur's reach.
-        let area = if blur {
-            tiles.grow(RADIUS, w, h)
-        } else {
-            tiles
+        let (tx0, tx1) = (tiles.x0 / TILE, tiles.x1.div_ceil(TILE));
+        let tw = tiles.width();
+        let source =
+            |y: usize, j: usize| reflect_exclusive(y as isize + j as isize - RADIUS as isize, h);
+        // Contrast rows: the pooled rows plus mask rows whose horizontal blur
+        // is not cached for these columns (rows the update changed included).
+        let mut rows = pool.clone();
+        if blur {
+            let masks = &self.levels[k].masks;
+            for j in 0..pool.len() + 2 * RADIUS {
+                let sy = source(pool.start, j);
+                if masks.iter().any(|m| !m.covers(sy, tiles.x0..tiles.x1)) {
+                    rows.start = rows.start.min(sy);
+                    rows.end = rows.end.max(sy + 1);
+                }
+            }
         }
-        .align_x(ALIGN, w);
+        let area = if blur {
+            Rect::new(tiles.x0, rows.start, tiles.x1, rows.end).grow(RADIUS, w, 0)
+        } else {
+            Rect::new(tiles.x0, rows.start, tiles.x1, rows.end)
+        };
+        let area = Rect::new(area.x0, rows.start, area.x1, rows.end).align_x(ALIGN, w);
         let (aw, ah) = (area.width(), area.height());
         let band = &reference.bands[k];
         let s = &mut self.scratch;
@@ -635,81 +869,101 @@ impl IncrementalState {
                 scale,
             },
         );
-        // Blurred masks over the tiles (exclusive reflection at image edges).
-        let (tw, th) = (tiles.width(), tiles.height());
+        // Blurred masks over the pooled rows (exclusive reflection at edges).
+        let ph = pool.len();
         for plane in &mut s.blurred {
-            ensure_len(plane, tw * th);
+            ensure_len(plane, tw * ph);
         }
-        // Expansion is dead after contrast conversion; reuse its storage for
-        // the horizontal blur rather than retaining another three planes.
-        let horizontal = &mut s.expanded;
+        let at = |x: usize, y: usize| (y - area.y0) * aw + x - area.x0;
         if blur {
-            let rows = tiles.grow(RADIUS, w, h);
-            // Every source row a vertical tap can read lies inside `rows`.
-            let at = |x: usize, y: usize| (y - area.y0) * aw + x - area.x0;
-            for ((mask, horizontal), blurred) in s.mask.iter().zip(horizontal).zip(&mut s.blurred) {
-                ensure_len(horizontal, rows.height() * tw);
-                let interior = tiles.x0 >= RADIUS && tiles.x1 + RADIUS <= w;
-                for y in rows.y0..rows.y1 {
-                    if !interior {
-                        s.padded.clear();
-                        for i in 0..tw + 2 * RADIUS {
-                            let x = reflect_exclusive(
-                                tiles.x0 as isize + i as isize - RADIUS as isize,
-                                w,
-                            );
-                            s.padded.push(mask[at(x, y)]);
-                        }
+            let blur = &self.blur;
+            let padded = &mut s.padded;
+            for ((mask, blurred), masks) in s
+                .mask
+                .iter()
+                .zip(&mut s.blurred)
+                .zip(&mut self.levels[k].masks)
+            {
+                let mut y = pool.start;
+                while y < pool.end {
+                    let count = VERTICAL_BATCH.min(pool.end - y);
+                    let window = count + 2 * RADIUS;
+                    // Every row a vertical tap reads, horizontally filtered
+                    // over the tile columns.
+                    for j in 0..window {
+                        let sy = source(y, j);
+                        masks.fill(sy, tiles.x0..tiles.x1, |columns, row| {
+                            let n = columns.len();
+                            let dst = &mut row[columns.clone()];
+                            if columns.start >= RADIUS && columns.end + RADIUS <= w {
+                                let from = at(columns.start - RADIUS, sy);
+                                blur.horizontal_row(&mask[from..from + n + 2 * RADIUS], dst);
+                            } else {
+                                padded.clear();
+                                for i in 0..n + 2 * RADIUS {
+                                    let x = reflect_exclusive(
+                                        columns.start as isize + i as isize - RADIUS as isize,
+                                        w,
+                                    );
+                                    padded.push(mask[at(x, sy)]);
+                                }
+                                blur.horizontal_row(padded, dst);
+                            }
+                        });
                     }
-                    let dst = &mut horizontal[(y - rows.y0) * tw..][..tw];
-                    if interior {
-                        let from = at(tiles.x0 - RADIUS, y);
-                        self.blur
-                            .horizontal_row(&mask[from..from + tw + 2 * RADIUS], dst);
-                    } else {
-                        self.blur.horizontal_row(&s.padded, dst);
+                    let mut window_rows = [&[][..]; VERTICAL_BATCH + 2 * RADIUS];
+                    for (j, row) in window_rows[..window].iter_mut().enumerate() {
+                        *row = &masks.row(source(y, j))[tiles.x0..tiles.x1];
                     }
-                }
-                for y in tiles.y0..tiles.y1 {
-                    let src: blur::BlurRows<'_> = std::array::from_fn(|i| {
-                        let sy = reflect_exclusive(y as isize + i as isize - RADIUS as isize, h);
-                        &horizontal[(sy - rows.y0) * tw..][..tw]
-                    });
-                    let dst = &mut blurred[(y - tiles.y0) * tw..][..tw];
-                    self.blur.vertical_row(&src, dst);
+                    blur.vertical_rows(
+                        &window_rows[..window],
+                        tw,
+                        &mut blurred[(y - pool.start) * tw..],
+                        tw,
+                    );
+                    y += count;
                 }
             }
         } else {
             for (mask, blurred) in s.mask.iter().zip(&mut s.blurred) {
-                for y in tiles.y0..tiles.y1 {
-                    let from = (y - area.y0) * aw + tiles.x0 - area.x0;
-                    blurred[(y - tiles.y0) * tw..][..tw].copy_from_slice(&mask[from..from + tw]);
+                for y in pool.clone() {
+                    let from = at(tiles.x0, y);
+                    blurred[(y - pool.start) * tw..][..tw].copy_from_slice(&mask[from..from + tw]);
                 }
             }
         }
-        // Batch the strip with one validation/dispatch and no staging buffer.
-        // Individual row reductions still start at the same tile boundary.
+        // Pool the missing row terms; cold runs of rows in one dispatch.
         let level = &mut self.levels[k];
-        let c_at = (tiles.y0 - area.y0) * aw + tiles.x0 - area.x0;
-        let r_at = tiles.y0 * w + tiles.x0;
-        let t_at = tiles.y0 / TILE * level.tiles_x + tiles.x0 / TILE;
-        kernels::pool_tiles(
-            self.backend,
-            &kernels::TiledPool {
+        let pool_data = |rows: std::ops::Range<usize>, x0: usize, x1: usize| {
+            let c_at = at(x0, rows.start);
+            let b_at = (rows.start - pool.start) * tw + x0 - tiles.x0;
+            kernels::TiledPool {
                 current: s.contrast.each_ref().map(|v| &v[c_at..]),
-                reference: band.contrast.each_ref().map(|v| &v[r_at..]),
-                blurred: s.blurred.each_ref().map(|v| v.as_slice()),
+                reference: band.contrast.each_ref().map(|v| &v[rows.start * w + x0..]),
+                blurred: s.blurred.each_ref().map(|v| &v[b_at..]),
                 strides: [aw, w, tw],
-                width: tw,
-                height: th,
+                width: x1 - x0,
+                height: rows.len(),
                 parameters: self.params,
+            }
+        };
+        let (x0, x1) = (tiles.x0, (tx1 * TILE).min(w));
+        level.parts.fill_rows(
+            pool.clone(),
+            tx0..tx1,
+            |run, out, stride| {
+                kernels::pool_row_parts(self.backend, &pool_data(run, x0, x1), out, stride);
             },
-            &mut level.tiles[t_at..],
-            level.tiles_x,
+            |y, columns, row| {
+                let (a, b) = (columns.start * TILE, (columns.end * TILE).min(w));
+                kernels::pool_row_parts(
+                    self.backend,
+                    &pool_data(y..y + 1, a, b),
+                    &mut row[columns],
+                    0,
+                );
+            },
         );
-        for ty in tiles.y0 / TILE..tiles.y1.div_ceil(TILE) {
-            level.sum_tile_row(ty);
-        }
     }
 
     fn score_base(&self, reference: &PreparedReference) -> [f64; 3] {

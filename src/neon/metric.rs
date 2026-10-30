@@ -178,6 +178,7 @@ pub(crate) fn pool_neon(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // Dispatch validates all plane lengths and NEON availability.
     vector::pool::<Neon>(data)
 }
+#[cfg(test)]
 #[target_feature(enable = "neon")]
 pub(crate) fn pool_tiles_neon(
     data: &crate::kernels::TiledPool<'_>,
@@ -186,6 +187,15 @@ pub(crate) fn pool_tiles_neon(
 ) {
     // Dispatch validates all strip strides, output lengths and NEON availability.
     vector::pool_tiles::<Neon>(data, tiles, stride);
+}
+#[target_feature(enable = "neon")]
+pub(crate) fn pool_parts_neon(
+    data: &crate::kernels::TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    stride: usize,
+) {
+    // Dispatch validates the strip strides, output length and CPU availability.
+    vector::pool_parts::<Neon>(data, parts, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]

@@ -95,6 +95,70 @@ fn batches_match_individual_calls_exactly_for_strides_tails_and_partial_tiles() 
 }
 
 #[test]
+fn row_parts_summed_in_row_order_match_batches_exactly() {
+    for backend in [Backend::Scalar, Backend::Neon, Backend::Sse2, Backend::Avx2] {
+        if !backend.is_available() {
+            continue;
+        }
+        for w in 1..=69 {
+            for h in [1, 7, 8, 9, 17] {
+                let strides = [w + 3, w + 13, w + 7];
+                let planes = inputs(w, h, strides);
+                let data = TiledPool {
+                    current: planes[0].each_ref().map(Vec::as_slice),
+                    reference: planes[1].each_ref().map(Vec::as_slice),
+                    blurred: planes[2].each_ref().map(Vec::as_slice),
+                    strides,
+                    width: w,
+                    height: h,
+                    parameters: crate::model::mask_parameters(),
+                };
+                let columns = w.div_ceil(POOL_TILE);
+                let mut expected = vec![[0.0; 3]; columns * h.div_ceil(POOL_TILE)];
+                pool_tiles(backend, &data, &mut expected, columns);
+                // Row terms, computed over arbitrary tile-column ranges.
+                let mut parts = vec![[[0.0; 3]; 16]; h];
+                for (y, row) in parts.iter_mut().enumerate() {
+                    let split = (y * 7) % columns.max(1);
+                    for range in [0..split, split..columns] {
+                        if range.is_empty() {
+                            continue;
+                        }
+                        let x0 = range.start * POOL_TILE;
+                        let x1 = (range.end * POOL_TILE).min(w);
+                        let [c, r, b] = strides.map(|stride| y * stride + x0);
+                        let one = TiledPool {
+                            current: data.current.map(|v| &v[c..]),
+                            reference: data.reference.map(|v| &v[r..]),
+                            blurred: data.blurred.map(|v| &v[b..]),
+                            strides,
+                            width: x1 - x0,
+                            height: 1,
+                            parameters: data.parameters,
+                        };
+                        pool_row_parts(backend, &one, &mut row[range], 0);
+                    }
+                }
+                for (t, expected) in expected.iter().enumerate() {
+                    let (ty, tx) = (t / columns, t % columns);
+                    let mut sums = [0.0f64; 3];
+                    for row in &parts[ty * POOL_TILE..((ty + 1) * POOL_TILE).min(h)] {
+                        for (sum, value) in sums.iter_mut().zip(row[tx]) {
+                            *sum += value;
+                        }
+                    }
+                    assert_eq!(
+                        sums.map(f64::to_bits),
+                        expected.map(f64::to_bits),
+                        "{backend:?} {w}x{h} tile {t}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn batches_validate_every_plane_and_output_before_simd() {
     let planes = inputs(17, 9, [17; 3]);
     let data = TiledPool {
