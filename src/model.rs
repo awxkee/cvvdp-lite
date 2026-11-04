@@ -180,10 +180,11 @@ impl CvvdpLite {
             if base {
                 let bg = mean_luminance(&current[0][..count]);
                 let s = csf_at_luminance(&csf, bg);
+                let inv_bg = 1.0 / bg;
                 for c in 0..3 {
                     sensitivity[c][0] = s[c];
                     for (i, v) in current[c][..count].iter().enumerate() {
-                        contrast[c][i] = (*v / bg).min(1000.0) * s[c];
+                        contrast[c][i] = (*v * inv_bg).min(1000.0) * s[c];
                     }
                 }
             } else {
@@ -209,9 +210,10 @@ impl CvvdpLite {
                 for i in 0..count {
                     let bg = expanded[0][i].max(0.01);
                     let s = csf_at_luminance(&csf, bg);
+                    let inv_bg = 1.0 / bg;
                     for c in 0..3 {
                         sensitivity[c][i] = s[c] * CH_GAIN[c];
-                        contrast[c][i] = ((current[c][i] - expanded[c][i]) / bg).min(1000.0)
+                        contrast[c][i] = ((current[c][i] - expanded[c][i]) * inv_bg).min(1000.0)
                             * band_scale
                             * sensitivity[c][i];
                     }
@@ -488,12 +490,12 @@ impl Workspace {
             let (w, h, count) = (band.w, band.h, band.w * band.h);
             let base = level == reference.bands.len() - 1;
             let squares = if base {
-                let bg = mean_luminance(&self.current[0][..count]);
+                let inv_bg = 1.0 / mean_luminance(&self.current[0][..count]);
                 let mut sums = [0.0_f64; 3];
                 for (c, sum) in sums.iter_mut().enumerate() {
                     let sensitivity = band.sensitivity[c][0];
                     for i in 0..count {
-                        let d = ((self.current[c][i] / bg).min(1000.0) * sensitivity
+                        let d = ((self.current[c][i] * inv_bg).min(1000.0) * sensitivity
                             - band.contrast[c][i])
                             .abs() as f64;
                         *sum += d * d + 2.0 * (EPSILON as f64) * d;
