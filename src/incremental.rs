@@ -970,7 +970,7 @@ impl IncrementalState {
         let level = &self.levels[self.levels.len() - 1];
         let band = &reference.bands[self.levels.len() - 1];
         let count = level.w * level.h;
-        let bg = model::mean_luminance(&level.gauss[0][..count]);
+        let inv_bg = 1.0 / model::mean_luminance(&level.gauss[0][..count]);
         let mut sums = [0.0_f64; 3];
         for (((sum, gauss), sensitivity), contrast) in sums
             .iter_mut()
@@ -980,7 +980,7 @@ impl IncrementalState {
         {
             let sensitivity = sensitivity[0];
             for (&value, &reference) in gauss[..count].iter().zip(&contrast[..count]) {
-                let d = ((value / bg).min(1000.0) * sensitivity - reference).abs() as f64;
+                let d = ((value * inv_bg).min(1000.0) * sensitivity - reference).abs() as f64;
                 *sum += d * d + 2.0 * (EPSILON as f64) * d;
             }
         }

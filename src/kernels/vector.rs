@@ -131,15 +131,18 @@ pub(crate) fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
         let scale = V::splat(data.scale);
         let floor = V::splat(0.01);
         let ceiling = V::splat(1000.0);
+        let one = V::splat(1.0);
         for i in (0..done).step_by(V::LANES) {
             let bg = V::max(V::load(data.expanded[0].as_ptr().add(i)), floor);
+            // The three channels share the achromatic background.
+            let inv_bg = V::div(one, bg);
             for c in 0..3 {
                 let src = V::load(data.current[c].as_ptr().add(i));
                 let low = V::load(data.expanded[c].as_ptr().add(i));
                 let sensitivity = V::load(data.sensitivity[c].as_ptr().add(i));
                 let reference = V::load(data.reference[c].as_ptr().add(i));
                 let weighted = V::mul(
-                    V::mul(V::min(V::div(V::sub(src, low), bg), ceiling), scale),
+                    V::mul(V::min(V::mul(V::sub(src, low), inv_bg), ceiling), scale),
                     sensitivity,
                 );
                 V::store(data.current[c].as_mut_ptr().add(i), weighted);
@@ -162,8 +165,11 @@ pub(crate) fn contrast_region<V: Vector>(data: &mut ContrastRegion<'_>) -> usize
         let scale = V::splat(data.scale);
         let floor = V::splat(0.01);
         let ceiling = V::splat(1000.0);
+        let one = V::splat(1.0);
         // Work through one channel's planes at a time. This keeps fewer row
         // pointers live and reads/writes contiguous planes without staging.
+        // The background enters as a reciprocal so this matches the per-row
+        // kernel, which shares one reciprocal across the three channels.
         for c in 0..3 {
             let current = data.current[c].as_ptr();
             let low = data.expanded[c].as_ptr();
@@ -181,7 +187,10 @@ pub(crate) fn contrast_region<V: Vector>(data: &mut ContrastRegion<'_>) -> usize
                     let sensitivity = V::load(sensitivity.add(src + x));
                     let reference = V::load(reference.add(src + x));
                     let weighted = V::mul(
-                        V::mul(V::min(V::div(V::sub(current, low), bg), ceiling), scale),
+                        V::mul(
+                            V::min(V::mul(V::sub(current, low), V::div(one, bg)), ceiling),
+                            scale,
+                        ),
                         sensitivity,
                     );
                     V::store(contrast.add(dst + x), weighted);
@@ -262,8 +271,12 @@ fn pool_with_powers<V: Vector>(data: &Pool<'_>, powers: &[PowerTable; 4]) -> (us
                 let power = pow::<V>(V::add(diff, epsilon), &powers[3]);
                 let numerator =
                     V::positive(diff, V::max(V::sub(power, V::splat(p.diff_zero)), zero));
-                let du = V::div(numerator, V::add(one, mask));
-                let d = V::div(V::mul(dmax, du), V::add(dmax, du));
+                // dmax·du / (dmax + du) with du = numerator / (1 + mask),
+                // folded into a single division.
+                let d = V::div(
+                    V::mul(dmax, numerator),
+                    V::add(V::mul(dmax, V::add(one, mask)), numerator),
+                );
                 V::accumulate(d, &mut lo[c], &mut hi[c]);
             }
         }

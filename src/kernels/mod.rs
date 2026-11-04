@@ -188,9 +188,9 @@ pub(crate) fn contrast(
     }
     let _ = backend;
     for i in done..count {
-        let bg = data.expanded[0][i].max(0.01);
+        let inv_bg = 1.0 / data.expanded[0][i].max(0.01);
         for c in 0..3 {
-            let weighted = ((data.current[c][i] - data.expanded[c][i]) / bg).min(1000.0)
+            let weighted = ((data.current[c][i] - data.expanded[c][i]) * inv_bg).min(1000.0)
                 * data.scale
                 * data.sensitivity[c][i];
             data.current[c][i] = weighted;
@@ -272,7 +272,7 @@ pub(crate) fn contrast_region(backend: Backend, mut data: ContrastRegion<'_>) {
                 .zip(output)
             {
                 let weighted =
-                    ((value - low) / bg.max(0.01)).min(1000.0) * data.scale * sensitivity;
+                    ((value - low) * (1.0 / bg.max(0.01))).min(1000.0) * data.scale * sensitivity;
                 *contrast = weighted;
                 *mask = weighted.abs().min(reference.abs());
             }
@@ -339,8 +339,10 @@ fn pool_scalar_tail(data: &Pool<'_>, done: usize, squares: &mut [f64; 3]) {
                 + activity[1] * parameters.xcm[1][c]
                 + activity[2] * parameters.xcm[2][c];
             let diff = (data.current[c][i] - data.reference[c][i]).abs();
-            let du = ((diff + EPSILON).powf(MASK_P) - parameters.diff_zero) / (1.0 + mask);
-            let d = (parameters.dmax * du / (parameters.dmax + du)) as f64;
+            let numerator = (diff + EPSILON).powf(MASK_P) - parameters.diff_zero;
+            // dmax·du / (dmax + du) with du = numerator / (1 + mask), one division.
+            let d =
+                (parameters.dmax * numerator / (parameters.dmax * (1.0 + mask) + numerator)) as f64;
             *sum += d * d + 2.0 * (EPSILON as f64) * d;
         }
     }
