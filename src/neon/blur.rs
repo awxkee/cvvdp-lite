@@ -27,14 +27,18 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 // Adapted from libblur's symmetric f32 filter1d kernels.
-use crate::blur::{BlurRows, RADIUS, WINDOW};
+use crate::blur::{BlurRows, RADIUS, WINDOW, horizontal_scalar, vertical_scalar};
 use std::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
 pub(crate) fn blur_horizontal_neon(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     assert!(src.len() >= dst.len() + 2 * RADIUS);
     let done = horizontal::<4>(src, k, dst);
-    done + horizontal::<1>(&src[done..], k, &mut dst[done..])
+    let done = done + horizontal::<1>(&src[done..], k, &mut dst[done..]);
+    if done < dst.len() {
+        horizontal_scalar::<true>(&src[done..], k, &mut dst[done..]);
+    }
+    dst.len()
 }
 
 #[inline]
@@ -42,11 +46,10 @@ pub(crate) fn blur_horizontal_neon(src: &[f32], k: &[f32; WINDOW], dst: &mut [f3
 fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 4;
     let center = vdupq_n_f32(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -62,14 +65,13 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let a = vld1q_f32(src.as_ptr().add(x + lane * LANES + i));
                     let b = vld1q_f32(src.as_ptr().add(x + lane * LANES + WINDOW - 1 - i));
-                    *acc = vaddq_f32(*acc, vmulq_f32(vaddq_f32(a, b), coeff));
+                    *acc = vfmaq_f32(*acc, vaddq_f32(a, b), coeff);
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                vst1q_f32(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                vst1q_f32(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
@@ -78,7 +80,11 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
 pub(crate) fn blur_vertical_neon(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     assert!(rows.iter().all(|row| row.len() >= dst.len()));
     let done = vertical::<4>(rows, k, dst);
-    done + vertical::<1>(&rows.map(|row| &row[done..]), k, &mut dst[done..])
+    let done = done + vertical::<1>(&rows.map(|row| &row[done..]), k, &mut dst[done..]);
+    if done < dst.len() {
+        vertical_scalar::<true>(&rows.map(|row| &row[done..]), k, &mut dst[done..]);
+    }
+    dst.len()
 }
 
 #[inline]
@@ -86,11 +92,10 @@ pub(crate) fn blur_vertical_neon(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &m
 fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 4;
     let center = vdupq_n_f32(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -106,46 +111,57 @@ fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let a = vld1q_f32(rows[i].as_ptr().add(x + lane * LANES));
                     let b = vld1q_f32(rows[WINDOW - 1 - i].as_ptr().add(x + lane * LANES));
-                    *acc = vaddq_f32(*acc, vmulq_f32(vaddq_f32(a, b), coeff));
+                    *acc = vfmaq_f32(*acc, vaddq_f32(a, b), coeff);
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                vst1q_f32(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                vst1q_f32(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
 
-/// # Safety
-/// NEON must be available, `width >= 4`, and `rows.len() > 2 * RADIUS`.
-/// Every `rows[j]` is valid for `width` samples and `out` for
-/// `(rows.len() - 2 * RADIUS - 1) * out_stride + width`.
-///
-/// Output row `y` reads `rows[y..y + WINDOW]` with the per-row kernels'
-/// expression (center, then pairs from the outermost in, unfused), so results
-/// match them bit for bit. Four output rows share sixteen row loads.
+/// Output row `y` reads `rows[y..y + WINDOW]` and fuses each pair into the
+/// center-first sum in the same order as the per-row kernels. Four output
+/// rows share sixteen row loads.
 #[target_feature(enable = "neon")]
 pub(crate) fn blur_vertical_region_neon(
+    rows: &[&[f32]],
+    k: &[f32; WINDOW],
+    width: usize,
+    out: &mut [f32],
+    out_stride: usize,
+) {
+    assert!(width >= 4);
+    crate::blur::validate_vertical_region(rows, width, out, out_stride);
+    // Keep only the pointers used by the hot filter after validating the slices.
+    let mut pointers = [std::ptr::null(); crate::blur::VERTICAL_BATCH + 2 * RADIUS];
+    let pointers = &mut pointers[..rows.len()];
+    for (pointer, row) in pointers.iter_mut().zip(rows) {
+        *pointer = row.as_ptr();
+    }
+    // SAFETY: The validated slices cover the entire region and cannot overlap.
+    unsafe { vertical_region(pointers, k, width, out.as_mut_ptr(), out_stride) };
+}
+
+#[inline(never)]
+#[target_feature(enable = "neon")]
+unsafe fn vertical_region(
     rows: &[*const f32],
     k: &[f32; WINDOW],
     width: usize,
     out: *mut f32,
     out_stride: usize,
 ) {
-    debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
     let outputs = rows.len() - 2 * RADIUS;
     let coeff: [float32x4_t; RADIUS + 1] = std::array::from_fn(|i| vdupq_n_f32(k[i]));
     #[inline]
     #[target_feature(enable = "neon")]
-    fn tap(window: &[float32x4_t], coeff: &[float32x4_t; RADIUS + 1]) -> float32x4_t {
+    fn tap(window: &[float32x4_t; WINDOW], coeff: &[float32x4_t; RADIUS + 1]) -> float32x4_t {
         let mut acc = vmulq_f32(window[RADIUS], coeff[RADIUS]);
         for i in (0..RADIUS).rev() {
-            acc = vaddq_f32(
-                acc,
-                vmulq_f32(vaddq_f32(window[i], window[WINDOW - 1 - i]), coeff[i]),
-            );
+            acc = vfmaq_f32(acc, vaddq_f32(window[i], window[WINDOW - 1 - i]), coeff[i]);
         }
         acc
     }
@@ -155,19 +171,23 @@ pub(crate) fn blur_vertical_region_neon(
     loop {
         let column = x.min(last);
         let mut y = 0;
+        // SAFETY: The loop limits keep the 16- and 13-row windows within
+        // rows. Column plus four fits every input and output row.
         unsafe {
             while y + 4 <= outputs {
+                let input = rows.as_ptr().add(y);
                 let window: [float32x4_t; WINDOW + 3] =
-                    std::array::from_fn(|j| vld1q_f32(rows[y + j].add(column)));
-                for o in 0..4 {
-                    let value = tap(&window[o..o + WINDOW], &coeff);
+                    std::array::from_fn(|j| vld1q_f32((*input.add(j)).add(column)));
+                for (o, taps) in window.array_windows::<WINDOW>().enumerate() {
+                    let value = tap(taps, &coeff);
                     vst1q_f32(out.add((y + o) * out_stride + column), value);
                 }
                 y += 4;
             }
             while y < outputs {
+                let input = rows.as_ptr().add(y);
                 let window: [float32x4_t; WINDOW] =
-                    std::array::from_fn(|j| vld1q_f32(rows[y + j].add(column)));
+                    std::array::from_fn(|j| vld1q_f32((*input.add(j)).add(column)));
                 vst1q_f32(out.add(y * out_stride + column), tap(&window, &coeff));
                 y += 1;
             }

@@ -65,17 +65,18 @@ fn rowwise(
             out[1 + y * w..][..w].copy_from_slice(&src[PREFIX + y * stride..][..w]);
         }
     }
+    for (mask, expanded) in masks.iter_mut().zip(&planes[1]) {
+        mask[1..1 + w * h].copy_from_slice(&expanded[PREFIX..PREFIX + w * h]);
+    }
     for y in 0..h {
         let dst = 1 + y * w;
-        let expanded = PREFIX + y * w;
         let src = PREFIX + y * stride;
         contrast(
             backend,
             output.each_mut().map(|v| &mut v[dst..dst + w]),
-            planes[1].each_ref().map(|v| &v[expanded..expanded + w]),
+            masks.each_mut().map(|v| &mut v[dst..dst + w]),
             planes[2].each_ref().map(|v| &v[src..src + w]),
             planes[3].each_ref().map(|v| &v[src..src + w]),
-            masks.each_mut().map(|v| &mut v[dst..dst + w]),
             scale,
         );
     }

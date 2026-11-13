@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 // Adapted from libblur's symmetric f32 filter1d kernels.
-use crate::blur::{BlurRows, RADIUS, WINDOW};
+use crate::blur::{BlurRows, RADIUS, WINDOW, horizontal_scalar, vertical_scalar};
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
@@ -36,20 +36,40 @@ use std::arch::x86_64::*;
 #[target_feature(enable = "avx2")]
 pub(crate) fn blur_horizontal_avx2(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     assert!(src.len() >= dst.len() + 2 * RADIUS);
-    let done = horizontal::<4>(src, k, dst);
-    done + horizontal::<1>(&src[done..], k, &mut dst[done..])
+    // SAFETY: AVX2 is enabled and the padding was validated.
+    unsafe {
+        let done = horizontal::<4, false>(src, k, dst);
+        done + horizontal::<1, false>(&src[done..], k, &mut dst[done..])
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn blur_horizontal_fma_avx2(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
+    assert!(src.len() >= dst.len() + 2 * RADIUS);
+    // SAFETY: AVX2 and FMA are enabled and the padding was validated.
+    let done = unsafe {
+        let done = horizontal::<4, true>(src, k, dst);
+        done + horizontal::<1, true>(&src[done..], k, &mut dst[done..])
+    };
+    if done < dst.len() {
+        horizontal_scalar::<true>(&src[done..], k, &mut dst[done..]);
+    }
+    dst.len()
 }
 
 #[inline]
 #[target_feature(enable = "avx2")]
-fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
+unsafe fn horizontal<const N: usize, const FMA: bool>(
+    src: &[f32],
+    k: &[f32; WINDOW],
+    dst: &mut [f32],
+) -> usize {
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -65,14 +85,13 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
                 for (lane, acc) in acc.iter_mut().enumerate() {
                     let a = _mm256_loadu_ps(src.as_ptr().add(x + lane * LANES + i));
                     let b = _mm256_loadu_ps(src.as_ptr().add(x + lane * LANES + WINDOW - 1 - i));
-                    *acc = _mm256_add_ps(*acc, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
+                    *acc = add_tap256::<FMA>(_mm256_add_ps(a, b), coeff, *acc);
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm256_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm256_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
@@ -89,11 +108,10 @@ pub(crate) fn blur_vertical_avx2(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &m
 fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -112,132 +130,165 @@ fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f
                     *acc = _mm256_add_ps(*acc, _mm256_mul_ps(_mm256_add_ps(a, b), coeff));
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm256_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm256_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
 
-/// # Safety
-/// The CPU feature must be available, `width >= 4`, and `rows.len() > 2 * RADIUS`.
-/// Each `rows[j]` is valid for `width` samples and `out` for
-/// `(rows.len() - 2 * RADIUS - 1) * out_stride + width`.
-///
-/// Every output is the per-row kernels' expression (center, then the pairs
-/// from the outermost in, unfused), so results match them bit for bit.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn blur_vertical_fma_avx2(
+    rows: &BlurRows<'_>,
+    k: &[f32; WINDOW],
+    dst: &mut [f32],
+) -> usize {
+    let width = dst.len();
+    if width >= 4 {
+        blur_vertical_region_fma_avx2(rows, k, width, dst, width);
+    } else {
+        // Regional dispatch sends rows narrower than four here.
+        assert!(rows.iter().all(|row| row.len() >= width));
+        vertical_scalar::<true>(rows, k, dst);
+    }
+    width
+}
+
+#[inline(always)]
+unsafe fn add_tap256<const FMA: bool>(pair: __m256, coeff: __m256, acc: __m256) -> __m256 {
+    // SAFETY: The caller enables AVX2 and enables FMA for the fused version.
+    unsafe {
+        if FMA {
+            _mm256_fmadd_ps(pair, coeff, acc)
+        } else {
+            _mm256_add_ps(acc, _mm256_mul_ps(pair, coeff))
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn add_tap128<const FMA: bool>(pair: __m128, coeff: __m128, acc: __m128) -> __m128 {
+    // SAFETY: The caller enables AVX2 and enables FMA for the fused version.
+    unsafe {
+        if FMA {
+            _mm_fmadd_ps(pair, coeff, acc)
+        } else {
+            _mm_add_ps(acc, _mm_mul_ps(pair, coeff))
+        }
+    }
+}
+
+/// Every output uses the per-row kernels' expression: center, then pairs
+/// from nearest to farthest.
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn blur_vertical_region_avx2(
-    rows: &[*const f32],
+pub(crate) fn blur_vertical_region_avx2(
+    rows: &[&[f32]],
     k: &[f32; WINDOW],
     width: usize,
-    out: *mut f32,
+    out: &mut [f32],
     out_stride: usize,
 ) {
-    debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
-    let outputs = rows.len() - 2 * RADIUS;
-    unsafe {
-        if width >= 8 {
-            let mut coeff = [_mm256_set1_ps(0.0); RADIUS + 1];
-            for (c, &v) in coeff.iter_mut().zip(k) {
-                *c = _mm256_set1_ps(v);
-            }
-            let tap = |window: &[__m256]| {
-                let mut acc = _mm256_mul_ps(window[RADIUS], coeff[RADIUS]);
-                for i in (0..RADIUS).rev() {
-                    acc = _mm256_add_ps(
-                        acc,
-                        _mm256_mul_ps(_mm256_add_ps(window[i], window[WINDOW - 1 - i]), coeff[i]),
-                    );
+    // SAFETY: AVX2 is enabled. The region is validated before SIMD access.
+    unsafe { vertical_region::<false>(rows, k, width, out, out_stride) }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn blur_vertical_region_fma_avx2(
+    rows: &[&[f32]],
+    k: &[f32; WINDOW],
+    width: usize,
+    out: &mut [f32],
+    out_stride: usize,
+) {
+    // SAFETY: AVX2 and FMA are enabled. The region is validated before SIMD access.
+    unsafe { vertical_region::<true>(rows, k, width, out, out_stride) }
+}
+
+#[inline(always)]
+unsafe fn vertical_region<const FMA: bool>(
+    rows: &[&[f32]],
+    k: &[f32; WINDOW],
+    width: usize,
+    out: &mut [f32],
+    out_stride: usize,
+) {
+    // Thirty-two-bit x86 exposes eight vector registers.
+    const BATCH: usize = if cfg!(target_arch = "x86_64") { 4 } else { 2 };
+    const INPUT_ROWS: usize = WINDOW + BATCH - 1;
+    assert!(width >= 4);
+    let outputs = crate::blur::validate_vertical_region(rows, width, out, out_stride);
+    let out = out.as_mut_ptr();
+    let full = outputs / BATCH * BATCH;
+    let batches = rows.array_windows::<INPUT_ROWS>().step_by(BATCH);
+    let tail = rows[full..].array_windows::<WINDOW>();
+    macro_rules! filter {
+        ($lanes:literal, $splat:ident, $load:ident, $store:ident, $add:ident, $mul:ident, $add_tap:ident) => {{
+            // SAFETY: The caller enables AVX2.
+            let center = unsafe { $splat(k[RADIUS]) };
+            // Complete vectors, then one overlapping vector for a short tail.
+            let last = width - $lanes;
+            let mut x = 0;
+            loop {
+                let column = x.min(last);
+                // SAFETY: The windows select valid rows, and column plus the
+                // vector width fits every input and output row.
+                unsafe {
+                    for (batch, input) in batches.clone().enumerate() {
+                        let mut acc = [center; BATCH];
+                        for (o, acc) in acc.iter_mut().enumerate() {
+                            *acc = $mul($load(input[o + RADIUS].as_ptr().add(column)), center);
+                        }
+                        // Keep only the output sums live and load one tap pair
+                        // at a time instead of retaining the whole input window.
+                        for i in (0..RADIUS).rev() {
+                            let coeff = $splat(k[i]);
+                            for (o, acc) in acc.iter_mut().enumerate() {
+                                let a = $load(input[o + i].as_ptr().add(column));
+                                let b = $load(input[o + WINDOW - 1 - i].as_ptr().add(column));
+                                *acc = $add_tap::<FMA>($add(a, b), coeff, *acc);
+                            }
+                        }
+                        for (o, acc) in acc.into_iter().enumerate() {
+                            $store(out.add((batch * BATCH + o) * out_stride + column), acc);
+                        }
+                    }
+                    for (y, input) in tail.clone().enumerate() {
+                        let mut acc = $mul($load(input[RADIUS].as_ptr().add(column)), center);
+                        for i in (0..RADIUS).rev() {
+                            let a = $load(input[i].as_ptr().add(column));
+                            let b = $load(input[WINDOW - 1 - i].as_ptr().add(column));
+                            acc = $add_tap::<FMA>($add(a, b), $splat(k[i]), acc);
+                        }
+                        $store(out.add((full + y) * out_stride + column), acc);
+                    }
                 }
-                acc
-            };
-            for dst in [out] {
-                // Complete vectors, then one overlapping vector for a short tail.
-                let last = width - 8;
-                let mut x = 0;
-                loop {
-                    let column = x.min(last);
-                    let mut y = 0;
-                    while y + 4 <= outputs {
-                        let mut window = [_mm256_set1_ps(0.0); WINDOW + 3];
-                        for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm256_loadu_ps(rows[y + j].add(column));
-                        }
-                        for o in 0..4 {
-                            _mm256_storeu_ps(
-                                dst.add((y + o) * out_stride + column),
-                                tap(&window[o..o + WINDOW]),
-                            );
-                        }
-                        y += 4;
-                    }
-                    while y < outputs {
-                        let mut window = [_mm256_set1_ps(0.0); WINDOW];
-                        for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm256_loadu_ps(rows[y + j].add(column));
-                        }
-                        _mm256_storeu_ps(dst.add(y * out_stride + column), tap(&window));
-                        y += 1;
-                    }
-                    if column == last {
-                        break;
-                    }
-                    x += 8;
+                if column == last {
+                    break;
                 }
+                x += $lanes;
             }
-        } else {
-            // 4..8 columns: the same lane arithmetic on 128-bit vectors.
-            let mut coeff = [_mm_set1_ps(0.0); RADIUS + 1];
-            for (c, &v) in coeff.iter_mut().zip(k) {
-                *c = _mm_set1_ps(v);
-            }
-            let tap = |window: &[__m128]| {
-                let mut acc = _mm_mul_ps(window[RADIUS], coeff[RADIUS]);
-                for i in (0..RADIUS).rev() {
-                    acc = _mm_add_ps(
-                        acc,
-                        _mm_mul_ps(_mm_add_ps(window[i], window[WINDOW - 1 - i]), coeff[i]),
-                    );
-                }
-                acc
-            };
-            for dst in [out] {
-                // Complete vectors, then one overlapping vector for a short tail.
-                let last = width - 4;
-                let mut x = 0;
-                loop {
-                    let column = x.min(last);
-                    let mut y = 0;
-                    while y + 4 <= outputs {
-                        let mut window = [_mm_set1_ps(0.0); WINDOW + 3];
-                        for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm_loadu_ps(rows[y + j].add(column));
-                        }
-                        for o in 0..4 {
-                            _mm_storeu_ps(
-                                dst.add((y + o) * out_stride + column),
-                                tap(&window[o..o + WINDOW]),
-                            );
-                        }
-                        y += 4;
-                    }
-                    while y < outputs {
-                        let mut window = [_mm_set1_ps(0.0); WINDOW];
-                        for (j, value) in window.iter_mut().enumerate() {
-                            *value = _mm_loadu_ps(rows[y + j].add(column));
-                        }
-                        _mm_storeu_ps(dst.add(y * out_stride + column), tap(&window));
-                        y += 1;
-                    }
-                    if column == last {
-                        break;
-                    }
-                    x += 4;
-                }
-            }
-        }
+        }};
+    }
+    if width >= 8 {
+        filter!(
+            8,
+            _mm256_set1_ps,
+            _mm256_loadu_ps,
+            _mm256_storeu_ps,
+            _mm256_add_ps,
+            _mm256_mul_ps,
+            add_tap256
+        );
+    } else {
+        filter!(
+            4,
+            _mm_set1_ps,
+            _mm_loadu_ps,
+            _mm_storeu_ps,
+            _mm_add_ps,
+            _mm_mul_ps,
+            add_tap128
+        );
     }
 }

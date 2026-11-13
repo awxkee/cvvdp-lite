@@ -113,6 +113,99 @@ fn agrees_with_pinned_original_still_model() {
 }
 
 #[test]
+fn one_shot_matches_prepared_comparison_bit_for_bit() {
+    let metric = CvvdpLite::new(Display::standard_4k()).unwrap();
+    for (w, h) in [
+        (1, 1),
+        (3, 17),
+        (17, 3),
+        (5, 17),
+        (17, 5),
+        (7, 7),
+        (7, 8),
+        (8, 9),
+        (9, 8),
+        (13, 9),
+        (17, 15),
+        (31, 16),
+        (33, 17),
+        (67, 65),
+    ] {
+        let reference = pattern(w, h);
+        let candidate = distort(&reference, w, h, "noise", 11);
+        let interleaved_stride = 3 * w + 5;
+        let planar_stride = w + 3;
+        let encodings = [reference, candidate].map(|pixels| {
+            let mut bytes = vec![0; (h - 1) * interleaved_stride + 3 * w];
+            let mut srgb = vec![f32::NAN; bytes.len()];
+            let mut linear = std::array::from_fn(|_| vec![f32::NAN; (h - 1) * planar_stride + w]);
+            for (y, row) in pixels.chunks_exact(3 * w).enumerate() {
+                let start = y * interleaved_stride;
+                bytes[start..start + 3 * w].copy_from_slice(row);
+                for (x, rgb) in row.as_chunks::<3>().0.iter().enumerate() {
+                    for c in 0..3 {
+                        let value = f32::from(rgb[c]) / 255.0;
+                        srgb[start + 3 * x + c] = value;
+                        linear[c][y * planar_stride + x] = value;
+                    }
+                }
+            }
+            (bytes, srgb, linear)
+        });
+        let [references, candidates] = encodings.each_ref().map(|(bytes, srgb, linear)| {
+            [
+                RgbImage::srgb8(bytes, w, h, interleaved_stride).unwrap(),
+                RgbImage::srgb_f32(srgb, w, h, interleaved_stride).unwrap(),
+                RgbImage::linear_rgb(linear.each_ref().map(Vec::as_slice), w, h, planar_stride)
+                    .unwrap(),
+            ]
+        });
+        for (r, reference) in references.into_iter().enumerate() {
+            let prepared = metric.prepare_reference(reference).unwrap();
+            let mut evaluator = prepared.evaluator();
+            for (c, candidate) in candidates.into_iter().enumerate() {
+                let expected = evaluator.compare(candidate).unwrap();
+                let actual = metric.compare(reference, candidate).unwrap();
+                assert_eq!(
+                    [actual.jod.to_bits(), actual.distortion.to_bits()],
+                    [expected.jod.to_bits(), expected.distortion.to_bits()],
+                    "{w}x{h}, reference format {r}, candidate format {c}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn one_shot_rejects_bad_dimensions_and_nonfinite_samples() {
+    let (w, h) = (17, 19);
+    let metric = CvvdpLite::new(Display::default()).unwrap();
+    let pixels = pattern(w, h);
+    let good = RgbImage::srgb8(&pixels, w, h, w * 3).unwrap();
+    let short = RgbImage::srgb8(&pixels, w, h - 1, w * 3).unwrap();
+    let narrow = RgbImage::srgb8(&pixels, w - 1, h, w * 3).unwrap();
+
+    let mut gamma = vec![0.5; w * h * 3];
+    *gamma.last_mut().unwrap() = f32::NAN;
+    let bad_gamma = RgbImage::srgb_f32(&gamma, w, h, w * 3).unwrap();
+    let mut red = vec![0.5; w * h];
+    let other = vec![0.5; w * h];
+    red[w * (h - 1)] = f32::INFINITY;
+    let bad_linear = RgbImage::linear_rgb([&red, &other, &other], w, h, w).unwrap();
+
+    assert_eq!(metric.compare(good, short), Err(Error::DimensionMismatch));
+    assert_eq!(metric.compare(good, narrow), Err(Error::DimensionMismatch));
+    assert_eq!(
+        metric.compare(bad_gamma, short),
+        Err(Error::DimensionMismatch)
+    );
+    for bad in [bad_gamma, bad_linear] {
+        assert_eq!(metric.compare(bad, good), Err(Error::NonFiniteSample));
+        assert_eq!(metric.compare(good, bad), Err(Error::NonFiniteSample));
+    }
+}
+
+#[test]
 fn identity_and_finite_scores_for_tiny_and_thin_images() {
     let metric = CvvdpLite::new(Display::default()).unwrap();
     for (w, h) in [

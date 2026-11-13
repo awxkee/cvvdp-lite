@@ -107,28 +107,40 @@ pub(crate) fn expand_odd_neon(rows: &Rows<'_, 2>, dst: &mut [f32]) -> usize {
 pub(crate) fn reduce_horizontal_neon(src: &[f32], dst: &mut [f32]) -> usize {
     assert!(src.len() >= 2 * dst.len() + 3);
     // Deinterleaving reads one extra odd sample beyond the final outer tap.
-    // Keep that load inside src; a final vector without the sample uses tails.
-    let done = dst.len().min(src.len().saturating_sub(4) / 2) / 4 * 4;
-    // SAFETY: NEON is enabled, and done accounts for both complete
-    // deinterleaving loads through the furthest shifted input and every store.
-    unsafe {
-        let taps = src.array_windows::<12>().step_by(8);
-        for (taps, dst) in taps.zip(dst[..done].as_chunks_mut::<4>().0) {
-            let p = taps.as_ptr();
-            let float32x4x2_t(a, b) = vld2q_f32(p);
-            let float32x4x2_t(c, d) = vld2q_f32(p.add(2));
-            let float32x4x2_t(e, _) = vld2q_f32(p.add(4));
-            let value = vaddq_f32(
-                vaddq_f32(
-                    vmulq_f32(vaddq_f32(a, e), vdupq_n_f32(0.05)),
-                    vmulq_f32(vaddq_f32(b, d), vdupq_n_f32(0.25)),
-                ),
-                vmulq_f32(c, vdupq_n_f32(0.4)),
-            );
-            vst1q_f32(dst.as_mut_ptr(), value);
-        }
+    let groups = dst.len().min(src.len().saturating_sub(4) / 2) / 4;
+    let (groups_out, _) = dst[..4 * groups].as_chunks_mut::<4>();
+    let (pairs, tail) = groups_out.as_chunks_mut::<2>();
+    for (i, [first, second]) in pairs.iter_mut().enumerate() {
+        // SAFETY: The group count bounds the furthest tap of both vectors.
+        let taps = unsafe { &*src.as_ptr().add(16 * i).cast::<[f32; 20]>() };
+        reduce_group(taps.first_chunk().unwrap(), first);
+        reduce_group(taps.last_chunk().unwrap(), second);
     }
-    done
+    if let [last] = tail {
+        // SAFETY: The last group also fits the validated input length.
+        let taps = unsafe { &*src.as_ptr().add(8 * (groups - 1)).cast::<[f32; 12]>() };
+        reduce_group(taps, last);
+    }
+    4 * groups
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn reduce_group(src: &[f32; 12], dst: &mut [f32; 4]) {
+    // SAFETY: The fixed-size arrays cover every vector load and store.
+    unsafe {
+        let float32x4x2_t(a, b) = vld2q_f32(src.as_ptr());
+        let float32x4x2_t(c, d) = vld2q_f32(src[2..].as_ptr());
+        let float32x4x2_t(e, _) = vld2q_f32(src[4..].as_ptr());
+        let value = vaddq_f32(
+            vaddq_f32(
+                vmulq_f32(vaddq_f32(a, e), vdupq_n_f32(0.05)),
+                vmulq_f32(vaddq_f32(b, d), vdupq_n_f32(0.25)),
+            ),
+            vmulq_f32(c, vdupq_n_f32(0.4)),
+        );
+        vst1q_f32(dst.as_mut_ptr(), value);
+    }
 }
 
 #[target_feature(enable = "neon")]
@@ -136,24 +148,36 @@ pub(crate) fn expand_horizontal_neon(src: &[f32], dst: &mut [f32]) -> usize {
     assert!(dst.len().is_multiple_of(2));
     let samples = dst.len() / 2;
     assert!(src.len() >= samples + 2);
-    let done = samples / 4 * 4;
-    // SAFETY: NEON is enabled. Source covers the three shifted
-    // vectors, and dst covers both interleaved output vectors for every step.
-    unsafe {
-        let taps = src.array_windows::<6>().step_by(4);
-        for (taps, dst) in taps.zip(dst.as_chunks_mut::<8>().0) {
-            let p = taps.as_ptr();
-            let a = vld1q_f32(p);
-            let b = vld1q_f32(p.add(1));
-            let c = vld1q_f32(p.add(2));
-            let even = vaddq_f32(
-                vmulq_f32(vaddq_f32(a, c), vdupq_n_f32(0.1)),
-                vmulq_f32(b, vdupq_n_f32(0.8)),
-            );
-            let odd = vmulq_f32(vaddq_f32(b, c), vdupq_n_f32(0.5));
-            let out = dst.as_mut_ptr();
-            vst2q_f32(out, float32x4x2_t(even, odd));
-        }
+    let groups = samples / 4;
+    let (groups_out, _) = dst[..8 * groups].as_chunks_mut::<8>();
+    let (pairs, tail) = groups_out.as_chunks_mut::<2>();
+    for (i, [first, second]) in pairs.iter_mut().enumerate() {
+        // SAFETY: The group count bounds the furthest tap of both vectors.
+        let taps = unsafe { &*src.as_ptr().add(8 * i).cast::<[f32; 10]>() };
+        expand_group(taps.first_chunk().unwrap(), first);
+        expand_group(taps.last_chunk().unwrap(), second);
     }
-    2 * done
+    if let [last] = tail {
+        // SAFETY: The last group also fits the validated input length.
+        let taps = unsafe { &*src.as_ptr().add(4 * (groups - 1)).cast::<[f32; 6]>() };
+        expand_group(taps, last);
+    }
+    8 * groups
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn expand_group(src: &[f32; 6], dst: &mut [f32; 8]) {
+    // SAFETY: The fixed-size arrays cover every vector load and store.
+    unsafe {
+        let a = vld1q_f32(src.as_ptr());
+        let b = vld1q_f32(src[1..].as_ptr());
+        let c = vld1q_f32(src[2..].as_ptr());
+        let even = vaddq_f32(
+            vmulq_f32(vaddq_f32(a, c), vdupq_n_f32(0.1)),
+            vmulq_f32(b, vdupq_n_f32(0.8)),
+        );
+        let odd = vmulq_f32(vaddq_f32(b, c), vdupq_n_f32(0.5));
+        vst2q_f32(dst.as_mut_ptr(), float32x4x2_t(even, odd));
+    }
 }

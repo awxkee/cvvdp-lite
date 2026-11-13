@@ -28,7 +28,7 @@
  */
 
 use cvvdp_lite::{
-    Backend, Checkpoint, CvvdpLite, Display, IncrementalState, Rect, RgbImage, Workspace,
+    Backend, Checkpoint, CvvdpLite, Display, Error, IncrementalState, Rect, RgbImage, Workspace,
 };
 
 fn planes(w: usize, h: usize, seed: u32) -> [Vec<f32>; 3] {
@@ -163,4 +163,112 @@ fn updates_reach_the_fresh_state_exactly() {
             }
         }
     }
+}
+
+#[test]
+fn compact_reference_matches_dense_for_incremental_updates_and_rollback() {
+    let metric = CvvdpLite::new(Display::standard_4k()).unwrap();
+    let score_bits = |score: cvvdp_lite::Score| [score.jod.to_bits(), score.distortion.to_bits()];
+    for backend in [Backend::Scalar, Backend::Neon, Backend::Sse2, Backend::Avx2] {
+        if !backend.is_available() {
+            continue;
+        }
+        for (w, h) in [(1, 1), (7, 129), (67, 65)] {
+            let reference = planes(w, h, 1);
+            let reference = image(&reference, w, h);
+            let dense = metric.prepare_reference(reference).unwrap();
+            let compact = metric.prepare_reference_compact(reference).unwrap();
+            let original = planes(w, h, 2);
+            let initial = image(&original, w, h);
+            let mut dense_state = IncrementalState::with_backend(&dense, initial, backend).unwrap();
+            let mut compact_state =
+                IncrementalState::with_backend(&compact, initial, backend).unwrap();
+            let initial_bits = score_bits(dense_state.score());
+            assert_eq!(score_bits(compact_state.score()), initial_bits);
+
+            let mut dense_checkpoint = Checkpoint::default();
+            let mut compact_checkpoint = Checkpoint::default();
+            for rect in [
+                Rect::new(0, 0, w, h),
+                Rect::new(w / 2, h / 2, w / 2 + 1, h / 2 + 1),
+                Rect::new(w - 1, h - 1, w, h),
+            ] {
+                let mut pixels = original.clone();
+                for y in rect.y0..rect.y1 {
+                    pixels[0][y * w + rect.x0..y * w + rect.x1].fill(0.0);
+                }
+                let candidate = image(&pixels, w, h);
+                let expected = IncrementalState::with_backend(&dense, candidate, backend)
+                    .unwrap()
+                    .score();
+                // Both states can switch between representations of the same reference.
+                for (state, reference, checkpoint) in [
+                    (&mut dense_state, &compact, &mut dense_checkpoint),
+                    (&mut compact_state, &dense, &mut compact_checkpoint),
+                ] {
+                    let actual = state
+                        .update_checkpointed(reference, candidate, rect, checkpoint)
+                        .unwrap();
+                    assert_eq!(
+                        score_bits(actual),
+                        score_bits(expected),
+                        "{backend:?} {w}x{h} {rect:?}"
+                    );
+                    state.rollback(checkpoint);
+                    assert_eq!(score_bits(state.score()), initial_bits);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checkpoint_recovers_from_failed_conversion_and_clears_on_empty_update() {
+    let (w, h) = (65, 49);
+    let pixels = planes(w, h, 5);
+    let initial = image(&pixels, w, h);
+    let prepared = CvvdpLite::new(Display::default())
+        .unwrap()
+        .prepare_reference(initial)
+        .unwrap();
+    let mut state = IncrementalState::new(&prepared, initial).unwrap();
+    let mut checkpoint = Checkpoint::default();
+
+    let mut invalid = pixels.clone();
+    invalid[0][8 * w + 8] = 0.0;
+    invalid[0][9 * w + 8] = f32::NAN;
+    let failed = state.update_checkpointed(
+        &prepared,
+        image(&invalid, w, h),
+        Rect::new(8, 8, 9, 10),
+        &mut checkpoint,
+    );
+    assert_eq!(failed, Err(Error::NonFiniteSample));
+    state.rollback(&checkpoint);
+
+    // The nearby edit reads the Gaussian rows touched by the failed update.
+    let mut changed = pixels.clone();
+    changed[0][10 * w + 8] = 0.0;
+    let candidate = image(&changed, w, h);
+    let score = state
+        .update_checkpointed(
+            &prepared,
+            candidate,
+            Rect::new(8, 10, 9, 11),
+            &mut checkpoint,
+        )
+        .unwrap();
+    let fresh = IncrementalState::new(&prepared, candidate).unwrap().score();
+    assert_eq!(score.distortion.to_bits(), fresh.distortion.to_bits());
+    assert!(score.distortion > 0.0);
+
+    let empty = Rect::new(w, h, w, h);
+    state
+        .update_checkpointed(&prepared, candidate, empty, &mut checkpoint)
+        .unwrap();
+    state.rollback(&checkpoint);
+    assert_eq!(
+        state.score().distortion.to_bits(),
+        score.distortion.to_bits()
+    );
 }
