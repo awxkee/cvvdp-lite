@@ -40,9 +40,9 @@
 //! sequence of updates hold bit-identical sums. Scores agree with
 //! [`crate::Workspace::compare`] to rounding (a different summation order).
 
-use crate::blur::{GaussianBlur, RADIUS, VERTICAL_BATCH};
+use crate::blur::{GaussianBlur, RADIUS, VERTICAL_BATCH, blur_active, reflect_exclusive};
 use crate::image::RgbToDkl;
-use crate::kernels::{self, EPSILON, MaskParameters};
+use crate::kernels::{self, MaskParameters};
 use crate::model::{self, PreparedReference};
 use crate::pyramid::{self, ensure_len};
 use crate::{Backend, Error, RgbImage, Score};
@@ -123,6 +123,15 @@ impl Rect {
         )
     }
 
+    fn tile_indices(self) -> Self {
+        Self::new(
+            self.x0 / TILE,
+            self.y0 / TILE,
+            self.x1.div_ceil(TILE),
+            self.y1.div_ceil(TILE),
+        )
+    }
+
     fn width(self) -> usize {
         self.x1 - self.x0
     }
@@ -167,22 +176,6 @@ fn reflect(i: isize, n: usize) -> usize {
     } else {
         i as usize
     }
-}
-
-/// Exclusive edge reflection of the masking blur.
-#[inline]
-fn reflect_exclusive(i: isize, n: usize) -> usize {
-    if i < 0 {
-        (-i) as usize
-    } else if i >= n as isize {
-        2 * n - i as usize - 2
-    } else {
-        i as usize
-    }
-}
-
-fn blur_active(w: usize, h: usize) -> bool {
-    w > RADIUS && h > RADIUS
 }
 
 /// Slots of the row caches. One vertical batch reads `VERTICAL_BATCH + 2·RADIUS`
@@ -348,15 +341,14 @@ struct Scratch {
     tmp: Vec<f32>,
     expanded: [Vec<f32>; 3],
     contrast: [Vec<f32>; 3],
+    // Raw masks become blurred masks once the horizontal pass is cached.
     mask: [Vec<f32>; 3],
-    blurred: [Vec<f32>; 3],
     padded: Vec<f32>,
 }
 
 impl Scratch {
     fn reserve(&mut self, w: usize, h: usize) {
         let area = w * h.min(POOL_ROWS + 2 * RADIUS);
-        let pooled = w * h.min(POOL_ROWS);
         for plane in &mut self.row {
             ensure_len(plane, w);
         }
@@ -368,35 +360,62 @@ impl Scratch {
         {
             ensure_len(plane, area);
         }
-        for plane in &mut self.blurred {
-            ensure_len(plane, pooled);
-        }
         ensure_len(&mut self.tmp, w);
         self.padded.reserve_exact(w + 2 * RADIUS);
     }
 }
 
+struct BandUpdate {
+    coarse: Rect,
+    masks: Option<std::ops::Range<usize>>,
+    parts: std::ops::Range<usize>,
+    tiles: Rect,
+}
+
 /// What an update overwrote, for an exact [`IncrementalState::rollback`].
 #[derive(Default)]
 pub struct Checkpoint {
-    gauss: Vec<(usize, Rect)>,
+    first: Option<Rect>,
+    bands: Vec<BandUpdate>,
     gauss_data: Vec<f32>,
-    tiles: Vec<(usize, usize, [f64; 3])>,
-    /// Rows per level whose blurred masks the update changed.
-    masks: Vec<(usize, usize, usize)>,
-    /// Rows per level whose pooled terms the update changed.
-    parts: Vec<(usize, usize, usize)>,
+    tile_data: Vec<[f64; 3]>,
     base: [f64; 3],
 }
 
 impl Checkpoint {
     /// Heap bytes retained for rollback, excluding allocator overhead.
     pub fn allocated_bytes(&self) -> usize {
-        self.gauss.capacity() * std::mem::size_of::<(usize, Rect)>()
+        self.bands.capacity() * std::mem::size_of::<BandUpdate>()
             + self.gauss_data.capacity() * std::mem::size_of::<f32>()
-            + self.tiles.capacity() * std::mem::size_of::<(usize, usize, [f64; 3])>()
-            + (self.masks.capacity() + self.parts.capacity())
-                * std::mem::size_of::<(usize, usize, usize)>()
+            + self.tile_data.capacity() * std::mem::size_of::<[f64; 3]>()
+    }
+
+    fn reserve(&mut self, state: &IncrementalState, mut dirty: Rect) {
+        let band_count = state.levels.len() - 1;
+        let mut samples = dirty.width() * dirty.height();
+        let mut tile_count = 0;
+        for k in 0..band_count {
+            let band = state.band_update(k, dirty);
+            dirty = band.coarse;
+            samples += dirty.width() * dirty.height();
+            let tiles = band.tiles.tile_indices();
+            tile_count += tiles.width() * tiles.height();
+        }
+        // The payloads are empty here. Reserve the entire backup at once
+        // while keeping any capacity from previous updates.
+        self.bands.reserve_exact(band_count);
+        self.gauss_data.reserve_exact(3 * samples);
+        self.tile_data.reserve_exact(tile_count);
+    }
+
+    fn save_gauss(&mut self, level: &Level, rect: Rect) {
+        for plane in &level.gauss {
+            for y in rect.y0..rect.y1 {
+                let start = y * level.w + rect.x0;
+                self.gauss_data
+                    .extend_from_slice(&plane[start..start + rect.width()]);
+            }
+        }
     }
 }
 
@@ -445,7 +464,6 @@ impl IncrementalState {
                 .chain(&scratch.expanded)
                 .chain(&scratch.contrast)
                 .chain(&scratch.mask)
-                .chain(&scratch.blurred)
                 .chain([&scratch.tmp, &scratch.padded])
                 .map(|v| v.capacity() * std::mem::size_of::<f32>())
                 .sum::<usize>()
@@ -565,11 +583,10 @@ impl IncrementalState {
         rect: Rect,
         checkpoint: &mut Checkpoint,
     ) -> Result<Score, Error> {
-        checkpoint.gauss.clear();
+        checkpoint.first = None;
+        checkpoint.bands.clear();
         checkpoint.gauss_data.clear();
-        checkpoint.tiles.clear();
-        checkpoint.masks.clear();
-        checkpoint.parts.clear();
+        checkpoint.tile_data.clear();
         checkpoint.base = self.base;
         self.apply(reference, test, rect, Some(checkpoint))?;
         Ok(self.score())
@@ -577,55 +594,59 @@ impl IncrementalState {
 
     /// Undo the [`Self::update_checkpointed`] that filled `checkpoint`.
     pub fn rollback(&mut self, checkpoint: &Checkpoint) {
-        let mut at = 0;
-        for &(k, r) in &checkpoint.gauss {
-            let level = &mut self.levels[k];
+        let mut gauss_data = checkpoint.gauss_data.as_slice();
+        let rects = checkpoint
+            .first
+            .into_iter()
+            .chain(checkpoint.bands.iter().map(|band| band.coarse));
+        for (level, r) in self.levels.iter_mut().zip(rects) {
             let w = level.w;
             for plane in &mut level.gauss {
                 for y in r.y0..r.y1 {
-                    let n = r.width();
-                    plane[y * w + r.x0..][..n].copy_from_slice(&checkpoint.gauss_data[at..at + n]);
-                    at += n;
+                    let (row, rest) = gauss_data.split_at(r.width());
+                    let start = y * w + r.x0;
+                    plane[start..start + row.len()].copy_from_slice(row);
+                    gauss_data = rest;
                 }
             }
         }
-        for &(k, t, sums) in checkpoint.tiles.iter().rev() {
-            self.levels[k].tiles[t] = sums;
-        }
-        // Checkpoint tiles are stored by level, then by row, then by column.
-        // Restore all tiles before summing each affected row exactly once.
-        let mut previous = None;
-        for &(k, t, _) in &checkpoint.tiles {
-            let level = &mut self.levels[k];
-            let ty = t / level.tiles_x;
-            if previous != Some((k, ty)) {
+        let mut tile_data = checkpoint.tile_data.as_slice();
+        for (level, band) in self.levels.iter_mut().zip(&checkpoint.bands) {
+            let tiles = band.tiles.tile_indices();
+            for ty in tiles.y0..tiles.y1 {
+                let (row, rest) = tile_data.split_at(tiles.width());
+                let start = ty * level.tiles_x + tiles.x0;
+                level.tiles[start..start + row.len()].copy_from_slice(row);
+                tile_data = rest;
                 level.sum_tile_row(ty);
-                previous = Some((k, ty));
             }
-        }
-        // The restored masks differ from the cached rows the update filtered.
-        for &(k, y0, y1) in &checkpoint.masks {
-            for masks in &mut self.levels[k].masks {
-                masks.invalidate(y0..y1);
+            if let Some(rows) = &band.masks {
+                for masks in &mut level.masks {
+                    masks.invalidate(rows.clone());
+                }
             }
+            level.parts.invalidate(band.parts.clone());
         }
-        for &(k, y0, y1) in &checkpoint.parts {
-            self.levels[k].parts.invalidate(y0..y1);
-        }
+        debug_assert!(gauss_data.is_empty() && tile_data.is_empty());
         self.base = checkpoint.base;
     }
 
-    fn save_gauss(&self, checkpoint: &mut Option<&mut Checkpoint>, k: usize, r: Rect) {
-        let Some(cp) = checkpoint.as_deref_mut() else {
-            return;
+    fn band_update(&self, k: usize, dirty: Rect) -> BandUpdate {
+        let fine = &self.levels[k];
+        let next = &self.levels[k + 1];
+        let coarse = reduce_footprint(dirty, next.w, next.h);
+        let changed = dirty.union(expand_footprint(coarse, fine.w, fine.h));
+        let masks = blur_active(fine.w, fine.h).then_some(changed.y0..changed.y1);
+        let pooled = if masks.is_some() {
+            changed.grow(RADIUS, fine.w, fine.h)
+        } else {
+            changed
         };
-        let level = &self.levels[k];
-        cp.gauss.push((k, r));
-        for plane in &level.gauss {
-            for y in r.y0..r.y1 {
-                cp.gauss_data
-                    .extend_from_slice(&plane[y * level.w + r.x0..][..r.width()]);
-            }
+        BandUpdate {
+            coarse,
+            masks,
+            parts: pooled.y0..pooled.y1,
+            tiles: pooled.align_tiles(fine.w, fine.h),
         }
     }
 
@@ -646,7 +667,11 @@ impl IncrementalState {
         let display = reference.display;
         // Level 0: the changed pixels in DKL, converted in aligned row segments.
         let mut dirty = rect.align_x(ALIGN, self.width);
-        self.save_gauss(&mut checkpoint, 0, dirty);
+        if let Some(cp) = checkpoint.as_deref_mut() {
+            cp.reserve(self, dirty);
+            cp.first = Some(dirty);
+            cp.save_gauss(&self.levels[0], dirty);
+        }
         for y in dirty.y0..dirty.y1 {
             test.crop(dirty.x0, y, dirty.width(), 1).to_dkl(
                 display.scale(),
@@ -662,43 +687,31 @@ impl IncrementalState {
         }
         let base_index = self.levels.len() - 1;
         for k in 0..base_index {
-            let (w, h) = (self.levels[k].w, self.levels[k].h);
-            let (nw, nh) = (self.levels[k + 1].w, self.levels[k + 1].h);
-            let coarse = reduce_footprint(dirty, nw, nh);
-            self.save_gauss(&mut checkpoint, k + 1, coarse);
-            self.reduce_region(k, coarse);
-            let changed = dirty.union(expand_footprint(coarse, w, h));
-            if blur_active(w, h) {
-                // Masks follow contrast, which changed only within `changed`.
-                for masks in &mut self.levels[k].masks {
-                    masks.invalidate(changed.y0..changed.y1);
-                }
-                if let Some(cp) = checkpoint.as_deref_mut() {
-                    cp.masks.push((k, changed.y0, changed.y1));
-                }
-            }
-            let pooled = if blur_active(w, h) {
-                changed.grow(RADIUS, w, h)
-            } else {
-                changed
-            };
-            // Pooled terms change wherever contrast or blurred masks do.
-            self.levels[k].parts.invalidate(pooled.y0..pooled.y1);
+            let band = self.band_update(k, dirty);
+            let tiles = band.tiles;
+            dirty = band.coarse;
             if let Some(cp) = checkpoint.as_deref_mut() {
-                cp.parts.push((k, pooled.y0, pooled.y1));
-            }
-            let tiles = pooled.align_tiles(w, h);
-            if let Some(cp) = checkpoint.as_deref_mut() {
+                cp.save_gauss(&self.levels[k + 1], dirty);
                 let level = &self.levels[k];
-                for ty in tiles.y0 / TILE..tiles.y1.div_ceil(TILE) {
-                    for tx in tiles.x0 / TILE..tiles.x1.div_ceil(TILE) {
-                        let t = ty * level.tiles_x + tx;
-                        cp.tiles.push((k, t, level.tiles[t]));
-                    }
+                let indices = tiles.tile_indices();
+                for ty in indices.y0..indices.y1 {
+                    let start = ty * level.tiles_x + indices.x0;
+                    cp.tile_data
+                        .extend_from_slice(&level.tiles[start..start + indices.width()]);
                 }
             }
+            self.reduce_region(k, dirty);
+            let level = &mut self.levels[k];
+            if let Some(rows) = &band.masks {
+                for masks in &mut level.masks {
+                    masks.invalidate(rows.clone());
+                }
+            }
+            level.parts.invalidate(band.parts.clone());
             self.pool_region(reference, k, tiles);
-            dirty = coarse;
+            if let Some(cp) = checkpoint.as_deref_mut() {
+                cp.bands.push(band);
+            }
         }
         self.base = self.score_base(reference);
         Ok(())
@@ -854,94 +867,85 @@ impl IncrementalState {
         let level = &self.levels[k];
         let scale = if k == 0 { 1.0 } else { 2.0 };
         let src = area.y0 * w + area.x0;
-        kernels::contrast_region(
-            self.backend,
-            kernels::ContrastRegion {
-                current: level.gauss.each_ref().map(|v| &v[src..]),
-                expanded: s.expanded.each_ref().map(|v| &v[..aw * ah]),
-                sensitivity: band.sensitivity.each_ref().map(|v| &v[src..]),
-                reference: band.contrast.each_ref().map(|v| &v[src..]),
-                contrast: s.contrast.each_mut().map(|v| &mut v[..aw * ah]),
-                mask: s.mask.each_mut().map(|v| &mut v[..aw * ah]),
-                width: aw,
-                height: ah,
-                source_stride: w,
-                scale,
-            },
-        );
-        // Blurred masks over the pooled rows (exclusive reflection at edges).
-        let ph = pool.len();
-        for plane in &mut s.blurred {
-            ensure_len(plane, tw * ph);
+        let mut contrast_rows =
+            |src: usize, dst: std::ops::Range<usize>, sensitivity: [&[f32]; 3], height| {
+                kernels::contrast_region(
+                    self.backend,
+                    kernels::ContrastRegion {
+                        current: level.gauss.each_ref().map(|v| &v[src..]),
+                        expanded: s.expanded.each_ref().map(|v| &v[dst.clone()]),
+                        sensitivity,
+                        reference: band.contrast.each_ref().map(|v| &v[src..]),
+                        contrast: s.contrast.each_mut().map(|v| &mut v[dst.clone()]),
+                        mask: s.mask.each_mut().map(|v| &mut v[dst.clone()]),
+                        width: aw,
+                        height,
+                        source_stride: w,
+                        scale,
+                    },
+                );
+            };
+        if let Some(dense) = band.dense_sensitivity() {
+            contrast_rows(src, 0..aw * ah, dense.each_ref().map(|v| &v[src..]), ah);
+        } else {
+            // Conversion has finished, so its row buffers can hold decoded weights.
+            for y in 0..ah {
+                let start = src + y * w;
+                band.decode_sensitivity(start..start + aw, s.row.each_mut().map(|v| &mut v[..aw]));
+                contrast_rows(
+                    start,
+                    y * aw..(y + 1) * aw,
+                    s.row.each_ref().map(|v| &v[..aw]),
+                    1,
+                );
+            }
         }
         let at = |x: usize, y: usize| (y - area.y0) * aw + x - area.x0;
         if blur {
             let blur = &self.blur;
             let padded = &mut s.padded;
-            for ((mask, blurred), masks) in s
-                .mask
-                .iter()
-                .zip(&mut s.blurred)
-                .zip(&mut self.levels[k].masks)
-            {
-                let mut y = pool.start;
-                while y < pool.end {
-                    let count = VERTICAL_BATCH.min(pool.end - y);
-                    let window = count + 2 * RADIUS;
-                    // Every row a vertical tap reads, horizontally filtered
-                    // over the tile columns.
-                    for j in 0..window {
-                        let sy = source(y, j);
-                        masks.fill(sy, tiles.x0..tiles.x1, |columns, row| {
-                            let n = columns.len();
-                            let dst = &mut row[columns.clone()];
-                            if columns.start >= RADIUS && columns.end + RADIUS <= w {
-                                let from = at(columns.start - RADIUS, sy);
-                                blur.horizontal_row(&mask[from..from + n + 2 * RADIUS], dst);
-                            } else {
-                                padded.clear();
-                                for i in 0..n + 2 * RADIUS {
-                                    let x = reflect_exclusive(
-                                        columns.start as isize + i as isize - RADIUS as isize,
-                                        w,
-                                    );
-                                    padded.push(mask[at(x, sy)]);
-                                }
-                                blur.horizontal_row(padded, dst);
+            let window = pool.len() + 2 * RADIUS;
+            let first = at(tiles.x0, pool.start);
+            for (mask, masks) in s.mask.iter_mut().zip(&mut self.levels[k].masks) {
+                // The strip fits one vertical batch. Cache all its horizontal
+                // inputs before writing over any of the raw masks.
+                for j in 0..window {
+                    let sy = source(pool.start, j);
+                    masks.fill(sy, tiles.x0..tiles.x1, |columns, row| {
+                        let n = columns.len();
+                        let dst = &mut row[columns.clone()];
+                        if columns.start >= RADIUS && columns.end + RADIUS <= w {
+                            let from = at(columns.start - RADIUS, sy);
+                            blur.horizontal_row(&mask[from..from + n + 2 * RADIUS], dst);
+                        } else {
+                            padded.clear();
+                            for i in 0..n + 2 * RADIUS {
+                                let x = reflect_exclusive(
+                                    columns.start as isize + i as isize - RADIUS as isize,
+                                    w,
+                                );
+                                padded.push(mask[at(x, sy)]);
                             }
-                        });
-                    }
-                    let mut window_rows = [&[][..]; VERTICAL_BATCH + 2 * RADIUS];
-                    for (j, row) in window_rows[..window].iter_mut().enumerate() {
-                        *row = &masks.row(source(y, j))[tiles.x0..tiles.x1];
-                    }
-                    blur.vertical_rows(
-                        &window_rows[..window],
-                        tw,
-                        &mut blurred[(y - pool.start) * tw..],
-                        tw,
-                    );
-                    y += count;
+                            blur.horizontal_row(padded, dst);
+                        }
+                    });
                 }
-            }
-        } else {
-            for (mask, blurred) in s.mask.iter().zip(&mut s.blurred) {
-                for y in pool.clone() {
-                    let from = at(tiles.x0, y);
-                    blurred[(y - pool.start) * tw..][..tw].copy_from_slice(&mask[from..from + tw]);
+                let mut window_rows = [&[][..]; VERTICAL_BATCH + 2 * RADIUS];
+                for (j, row) in window_rows[..window].iter_mut().enumerate() {
+                    *row = &masks.row(source(pool.start, j))[tiles.x0..tiles.x1];
                 }
+                blur.vertical_rows(&window_rows[..window], tw, &mut mask[first..], aw);
             }
         }
         // Pool the missing row terms; cold runs of rows in one dispatch.
         let level = &mut self.levels[k];
         let pool_data = |rows: std::ops::Range<usize>, x0: usize, x1: usize| {
             let c_at = at(x0, rows.start);
-            let b_at = (rows.start - pool.start) * tw + x0 - tiles.x0;
             kernels::TiledPool {
                 current: s.contrast.each_ref().map(|v| &v[c_at..]),
                 reference: band.contrast.each_ref().map(|v| &v[rows.start * w + x0..]),
-                blurred: s.blurred.each_ref().map(|v| &v[b_at..]),
-                strides: [aw, w, tw],
+                blurred: s.mask.each_ref().map(|v| &v[c_at..]),
+                strides: [aw, w, aw],
                 width: x1 - x0,
                 height: rows.len(),
                 parameters: self.params,
@@ -969,22 +973,12 @@ impl IncrementalState {
     fn score_base(&self, reference: &PreparedReference) -> [f64; 3] {
         let level = &self.levels[self.levels.len() - 1];
         let band = &reference.bands[self.levels.len() - 1];
-        let count = level.w * level.h;
-        let inv_bg = 1.0 / model::mean_luminance(&level.gauss[0][..count]);
-        let mut sums = [0.0_f64; 3];
-        for (((sum, gauss), sensitivity), contrast) in sums
-            .iter_mut()
-            .zip(&level.gauss)
-            .zip(&band.sensitivity)
-            .zip(&band.contrast)
-        {
-            let sensitivity = sensitivity[0];
-            for (&value, &reference) in gauss[..count].iter().zip(&contrast[..count]) {
-                let d = ((value * inv_bg).min(1000.0) * sensitivity - reference).abs() as f64;
-                *sum += d * d + 2.0 * (EPSILON as f64) * d;
-            }
-        }
-        sums
+        model::pool_baseband(
+            &level.gauss,
+            &band.contrast,
+            band.base_weights(),
+            level.w * level.h,
+        )
     }
 }
 

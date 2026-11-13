@@ -28,7 +28,7 @@
  */
 
 use crate::kernels::{
-    Contrast, Pool,
+    Contrast, POOL_TILE, Pool, PoolLanes,
     vector::{self, Vector},
 };
 #[cfg(target_arch = "x86")]
@@ -40,25 +40,24 @@ use std::arch::x86_64::*;
 struct Sse2;
 // SAFETY: SSE2 provides 4 f32 lanes. Validated dispatch enables
 // the CPU feature, and checked input lengths cover all complete vectors.
-unsafe impl Vector for Sse2 {
+unsafe impl Vector<4> for Sse2 {
     type F = __m128;
     type E = __m128i;
     type D = __m128d;
-    const LANES: usize = 4;
     #[inline(always)]
     unsafe fn splat(v: f32) -> Self::F {
         // SAFETY: Validated dispatch enables SSE2 and guarantees the Vector lane contract.
         unsafe { _mm_set1_ps(v) }
     }
     #[inline(always)]
-    unsafe fn load(p: *const f32) -> Self::F {
+    unsafe fn load(chunk: &[f32; 4]) -> Self::F {
         // SAFETY: Validated dispatch enables SSE2 and guarantees the Vector lane contract.
-        unsafe { _mm_loadu_ps(p) }
+        unsafe { _mm_loadu_ps(chunk.as_ptr()) }
     }
     #[inline(always)]
-    unsafe fn store(p: *mut f32, v: Self::F) {
+    unsafe fn store(chunk: &mut [f32; 4], v: Self::F) {
         // SAFETY: Validated dispatch enables SSE2 and guarantees the Vector lane contract.
-        unsafe { _mm_storeu_ps(p, v) }
+        unsafe { _mm_storeu_ps(chunk.as_mut_ptr(), v) }
     }
     #[inline(always)]
     unsafe fn add(a: Self::F, b: Self::F) -> Self::F {
@@ -104,6 +103,26 @@ unsafe impl Vector for Sse2 {
     unsafe fn zero_d() -> Self::D {
         // SAFETY: Validated dispatch enables SSE2 and guarantees the Vector lane contract.
         unsafe { _mm_setzero_pd() }
+    }
+    #[inline(always)]
+    unsafe fn load_sums(row: &[f64; POOL_TILE]) -> (Self::D, Self::D) {
+        let (chunks, _) = row.as_chunks::<2>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe {
+            (
+                _mm_loadu_pd(chunks[0].as_ptr()),
+                _mm_loadu_pd(chunks[1].as_ptr()),
+            )
+        }
+    }
+    #[inline(always)]
+    unsafe fn store_sums(row: &mut [f64; POOL_TILE], lo: Self::D, hi: Self::D) {
+        let (chunks, _) = row.as_chunks_mut::<2>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe {
+            _mm_storeu_pd(chunks[0].as_mut_ptr(), lo);
+            _mm_storeu_pd(chunks[1].as_mut_ptr(), hi);
+        }
     }
     #[inline(always)]
     unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
@@ -162,17 +181,19 @@ unsafe impl Vector for Sse2 {
 #[target_feature(enable = "sse2")]
 pub(crate) fn contrast_sse2(data: &mut Contrast<'_>) -> usize {
     // Dispatch validates slice lengths, domain, and SSE2 availability.
-    vector::contrast::<Sse2>(data)
+    vector::contrast::<Sse2, 4>(data)
+}
+/// # Safety
+/// The caller must validate all regional plane lengths and strides and enable SSE2.
+#[target_feature(enable = "sse2")]
+pub(crate) unsafe fn contrast_region_sse2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // SAFETY: The caller meets the regional contrast kernel's requirements.
+    unsafe { vector::contrast_region::<Sse2, 4>(data) }
 }
 #[target_feature(enable = "sse2")]
-pub(crate) fn contrast_region_sse2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
-    // Dispatch validates strided planes, compact outputs and SSE2 availability.
-    vector::contrast_region::<Sse2>(data)
-}
-#[target_feature(enable = "sse2")]
-pub(crate) fn pool_sse2(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) fn pool_sse2(data: &Pool<'_>, lanes: &mut PoolLanes, last: bool) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and SSE2 availability.
-    vector::pool::<Sse2>(data)
+    vector::pool::<Sse2, 4>(data, lanes, last)
 }
 #[cfg(test)]
 #[target_feature(enable = "sse2")]
@@ -182,7 +203,7 @@ pub(crate) fn pool_tiles_sse2(
     stride: usize,
 ) {
     // Dispatch validates all strip strides, output lengths and SSE2 availability.
-    vector::pool_tiles::<Sse2>(data, tiles, stride);
+    vector::pool_tiles::<Sse2, 4>(data, tiles, stride);
 }
 #[target_feature(enable = "sse2")]
 pub(crate) fn pool_parts_sse2(
@@ -191,11 +212,11 @@ pub(crate) fn pool_parts_sse2(
     stride: usize,
 ) {
     // Dispatch validates the strip strides, output length and CPU availability.
-    vector::pool_parts::<Sse2>(data, parts, stride);
+    vector::pool_parts::<Sse2, 4>(data, parts, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "sse2")]
 pub(crate) fn powers_sse2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     // The test wrapper checks slice lengths, domain, and SSE2 availability.
-    vector::powers::<Sse2>(input, output, exponent)
+    vector::powers::<Sse2, 4>(input, output, exponent)
 }

@@ -28,7 +28,7 @@
  */
 
 use crate::kernels::{
-    Contrast, Pool,
+    Contrast, POOL_TILE, Pool, PoolLanes,
     vector::{self, Vector},
 };
 #[cfg(target_arch = "x86")]
@@ -37,28 +37,28 @@ use std::arch::x86::*;
 use std::arch::x86_64::*;
 
 #[derive(Clone, Copy)]
-struct Avx2;
+struct Avx2<const FMA: bool>;
 // SAFETY: AVX2 provides 8 f32 lanes. Validated dispatch enables
-// the CPU feature, and checked input lengths cover all complete vectors.
-unsafe impl Vector for Avx2 {
+// the CPU features, including FMA for Avx2<true>, and checked input lengths
+// cover all complete vectors.
+unsafe impl<const FMA: bool> Vector<8> for Avx2<FMA> {
     type F = __m256;
     type E = __m256i;
     type D = __m256d;
-    const LANES: usize = 8;
     #[inline(always)]
     unsafe fn splat(v: f32) -> Self::F {
         // SAFETY: Validated dispatch enables AVX2 and guarantees the Vector lane contract.
         unsafe { _mm256_set1_ps(v) }
     }
     #[inline(always)]
-    unsafe fn load(p: *const f32) -> Self::F {
+    unsafe fn load(chunk: &[f32; 8]) -> Self::F {
         // SAFETY: Validated dispatch enables AVX2 and guarantees the Vector lane contract.
-        unsafe { _mm256_loadu_ps(p) }
+        unsafe { _mm256_loadu_ps(chunk.as_ptr()) }
     }
     #[inline(always)]
-    unsafe fn store(p: *mut f32, v: Self::F) {
+    unsafe fn store(chunk: &mut [f32; 8], v: Self::F) {
         // SAFETY: Validated dispatch enables AVX2 and guarantees the Vector lane contract.
-        unsafe { _mm256_storeu_ps(p, v) }
+        unsafe { _mm256_storeu_ps(chunk.as_mut_ptr(), v) }
     }
     #[inline(always)]
     unsafe fn add(a: Self::F, b: Self::F) -> Self::F {
@@ -74,6 +74,18 @@ unsafe impl Vector for Avx2 {
     unsafe fn mul(a: Self::F, b: Self::F) -> Self::F {
         // SAFETY: Validated dispatch enables AVX2 and guarantees the Vector lane contract.
         unsafe { _mm256_mul_ps(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(a: Self::F, b: Self::F, c: Self::F) -> Self::F {
+        // SAFETY: Both variants enable AVX2. Only FMA-enabled entry points
+        // instantiate Avx2<true>.
+        unsafe {
+            if FMA {
+                _mm256_fmadd_ps(a, b, c)
+            } else {
+                _mm256_add_ps(_mm256_mul_ps(a, b), c)
+            }
+        }
     }
     #[inline(always)]
     unsafe fn div(a: Self::F, b: Self::F) -> Self::F {
@@ -111,6 +123,26 @@ unsafe impl Vector for Avx2 {
         unsafe { _mm256_setzero_pd() }
     }
     #[inline(always)]
+    unsafe fn load_sums(row: &[f64; POOL_TILE]) -> (Self::D, Self::D) {
+        let (chunks, _) = row.as_chunks::<4>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe {
+            (
+                _mm256_loadu_pd(chunks[0].as_ptr()),
+                _mm256_loadu_pd(chunks[1].as_ptr()),
+            )
+        }
+    }
+    #[inline(always)]
+    unsafe fn store_sums(row: &mut [f64; POOL_TILE], lo: Self::D, hi: Self::D) {
+        let (chunks, _) = row.as_chunks_mut::<4>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe {
+            _mm256_storeu_pd(chunks[0].as_mut_ptr(), lo);
+            _mm256_storeu_pd(chunks[1].as_mut_ptr(), hi);
+        }
+    }
+    #[inline(always)]
     unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
         // SAFETY: The caller supplies positive normal inputs with AVX2 enabled.
         unsafe {
@@ -145,8 +177,17 @@ unsafe impl Vector for Avx2 {
             let a = _mm256_cvtps_pd(_mm256_castps256_ps128(value));
             let b = _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(value));
             let e = _mm256_set1_pd(2.0 * (crate::kernels::EPSILON as f64));
-            *lo = _mm256_add_pd(*lo, _mm256_add_pd(_mm256_mul_pd(a, a), _mm256_mul_pd(a, e)));
-            *hi = _mm256_add_pd(*hi, _mm256_add_pd(_mm256_mul_pd(b, b), _mm256_mul_pd(b, e)));
+            let contribution = |d| {
+                let linear = _mm256_mul_pd(d, e);
+                // The products are exact in f64 with f32-precision operands.
+                if FMA {
+                    _mm256_fmadd_pd(d, d, linear)
+                } else {
+                    _mm256_add_pd(_mm256_mul_pd(d, d), linear)
+                }
+            };
+            *lo = _mm256_add_pd(*lo, contribution(a));
+            *hi = _mm256_add_pd(*hi, contribution(b));
         }
     }
     #[inline(always)]
@@ -160,17 +201,28 @@ unsafe impl Vector for Avx2 {
 #[target_feature(enable = "avx2")]
 pub(crate) fn contrast_avx2(data: &mut Contrast<'_>) -> usize {
     // Dispatch validates slice lengths, domain, and AVX2 availability.
-    vector::contrast::<Avx2>(data)
+    vector::contrast::<Avx2<false>, 8>(data)
+}
+/// # Safety
+/// The caller must validate all regional plane lengths and strides and enable AVX2.
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn contrast_region_avx2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // SAFETY: The caller meets the regional contrast kernel's requirements.
+    unsafe { vector::contrast_region::<Avx2<false>, 8>(data) }
 }
 #[target_feature(enable = "avx2")]
-pub(crate) fn contrast_region_avx2(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
-    // Dispatch validates strided planes, compact outputs and AVX2 availability.
-    vector::contrast_region::<Avx2>(data)
-}
-#[target_feature(enable = "avx2")]
-pub(crate) fn pool_avx2(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) fn pool_avx2(data: &Pool<'_>, lanes: &mut PoolLanes, last: bool) -> (usize, [f64; 3]) {
     // Dispatch validates slice lengths, domain, and AVX2 availability.
-    vector::pool::<Avx2>(data)
+    vector::pool::<Avx2<false>, 8>(data, lanes, last)
+}
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn pool_fma_avx2(
+    data: &Pool<'_>,
+    lanes: &mut PoolLanes,
+    last: bool,
+) -> (usize, [f64; 3]) {
+    // Dispatch validates slice lengths, domain, and AVX2 and FMA availability.
+    vector::pool::<Avx2<true>, 8>(data, lanes, last)
 }
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
@@ -180,7 +232,18 @@ pub(crate) fn pool_tiles_avx2(
     stride: usize,
 ) {
     // Dispatch validates all strip strides, output lengths and AVX2 availability.
-    vector::pool_tiles::<Avx2>(data, tiles, stride);
+    let powers = vector::power_tables();
+    crate::kernels::pool_tiles_with(data, tiles, stride, |row| pool_row_avx2(row, powers));
+}
+#[cfg(test)]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn pool_tiles_fma_avx2(
+    data: &crate::kernels::TiledPool<'_>,
+    tiles: &mut [[f64; 3]],
+    stride: usize,
+) {
+    let powers = vector::power_tables();
+    crate::kernels::pool_tiles_with(data, tiles, stride, |row| pool_row_fma_avx2(row, powers));
 }
 #[target_feature(enable = "avx2")]
 pub(crate) fn pool_parts_avx2(
@@ -189,11 +252,49 @@ pub(crate) fn pool_parts_avx2(
     stride: usize,
 ) {
     // Dispatch validates the strip strides, output length and CPU availability.
-    vector::pool_parts::<Avx2>(data, parts, stride);
+    let powers = vector::power_tables();
+    crate::kernels::pool_parts_with(data, parts, stride, |row| pool_row_avx2(row, powers));
+}
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn pool_parts_fma_avx2(
+    data: &crate::kernels::TiledPool<'_>,
+    parts: &mut [[f64; 3]],
+    stride: usize,
+) {
+    let powers = vector::power_tables();
+    crate::kernels::pool_parts_with(data, parts, stride, |row| pool_row_fma_avx2(row, powers));
+}
+
+// Keep AVX2 enabled if the compiler outlines the row callback.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn pool_row_avx2(data: &Pool<'_>, powers: &[vector::PowerTable; 4]) -> [f64; 3] {
+    // SAFETY: This callback runs with AVX2 enabled and receives validated rows.
+    unsafe { pool_row::<false>(data, powers) }
+}
+
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn pool_row_fma_avx2(data: &Pool<'_>, powers: &[vector::PowerTable; 4]) -> [f64; 3] {
+    // SAFETY: This callback runs with AVX2 and FMA enabled and validated rows.
+    unsafe { pool_row::<true>(data, powers) }
+}
+
+#[inline(always)]
+unsafe fn pool_row<const FMA: bool>(data: &Pool<'_>, powers: &[vector::PowerTable; 4]) -> [f64; 3] {
+    let (done, mut squares) = vector::pool_with_powers::<Avx2<FMA>, 8>(data, powers);
+    crate::kernels::pool_scalar_tail(data, done, &mut squares);
+    squares
 }
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
 pub(crate) fn powers_avx2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     // The test wrapper checks slice lengths, domain, and AVX2 availability.
-    vector::powers::<Avx2>(input, output, exponent)
+    vector::powers::<Avx2<false>, 8>(input, output, exponent)
+}
+#[cfg(test)]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn powers_fma_avx2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+    // The test wrapper checks lengths, domain, and AVX2 and FMA availability.
+    vector::powers::<Avx2<true>, 8>(input, output, exponent)
 }

@@ -45,11 +45,10 @@ pub(crate) fn blur_horizontal_sse2(src: &[f32], k: &[f32; WINDOW], dst: &mut [f3
 fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 4;
     let center = _mm_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -68,11 +67,10 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
                     *acc = _mm_add_ps(*acc, _mm_mul_ps(_mm_add_ps(a, b), coeff));
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
@@ -89,11 +87,10 @@ pub(crate) fn blur_vertical_sse2(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &m
 fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f32]) -> usize {
     const LANES: usize = 4;
     let center = _mm_set1_ps(k[RADIUS]);
-    let mut done = 0;
     let (vectors, _) = dst.as_chunks_mut::<LANES>();
     let (blocks, _) = vectors.as_chunks_mut::<N>();
+    let done = blocks.len() * N * LANES;
     for (block, dst) in blocks.iter_mut().enumerate() {
-        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -112,80 +109,109 @@ fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f
                     *acc = _mm_add_ps(*acc, _mm_mul_ps(_mm_add_ps(a, b), coeff));
                 }
             }
-            for (lane, acc) in acc.into_iter().enumerate() {
-                _mm_storeu_ps(dst.as_mut_ptr().add(lane * LANES), acc);
+            for (dst, acc) in dst.iter_mut().zip(acc) {
+                _mm_storeu_ps(dst.as_mut_ptr(), acc);
             }
         }
-        done += N * LANES;
     }
     done
 }
 
-/// # Safety
-/// The CPU feature must be available, `width >= 4`, and `rows.len() > 2 * RADIUS`.
-/// Each `rows[j]` is valid for `width` samples and `out` for
-/// `(rows.len() - 2 * RADIUS - 1) * out_stride + width`.
-///
-/// Every output is the per-row kernels' expression (center, then the pairs
-/// from the outermost in, unfused), so results match them bit for bit.
+/// Every output uses the same center-first, unfused sum as the per-row kernel.
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn blur_vertical_region_sse2(
+pub(crate) fn blur_vertical_region_sse2(
+    rows: &[&[f32]],
+    k: &[f32; WINDOW],
+    width: usize,
+    out: &mut [f32],
+    out_stride: usize,
+) {
+    assert!(width >= 4);
+    crate::blur::validate_vertical_region(rows, width, out, out_stride);
+    // Keep only one pointer per row in the hot filter. The row slices
+    // remain borrowed, and the validation covers every pointer access.
+    let mut pointers = [std::ptr::null(); crate::blur::VERTICAL_BATCH + 2 * RADIUS];
+    let pointers = &mut pointers[..rows.len()];
+    for (pointer, row) in pointers.iter_mut().zip(rows) {
+        *pointer = row.as_ptr();
+    }
+    // SAFETY: The validated slices cover the entire region and cannot overlap.
+    unsafe { vertical_region(pointers, k, width, out.as_mut_ptr(), out_stride) };
+}
+
+#[inline(never)]
+#[target_feature(enable = "sse2")]
+unsafe fn vertical_region(
     rows: &[*const f32],
     k: &[f32; WINDOW],
     width: usize,
     out: *mut f32,
     out_stride: usize,
 ) {
-    debug_assert!(width >= 4 && rows.len() > 2 * RADIUS);
     let outputs = rows.len() - 2 * RADIUS;
+    // SAFETY: The caller validates the input and output footprints. Each
+    // block reads WINDOW + N - 1 row pointers for N remaining output rows,
+    // and its last vector starts no later than width - 4.
     unsafe {
-        let mut coeff = [_mm_set1_ps(0.0); RADIUS + 1];
-        for (c, &v) in coeff.iter_mut().zip(k) {
-            *c = _mm_set1_ps(v);
-        }
-        let tap = |window: &[__m128]| {
-            let mut acc = _mm_mul_ps(window[RADIUS], coeff[RADIUS]);
-            for i in (0..RADIUS).rev() {
-                acc = _mm_add_ps(
-                    acc,
-                    _mm_mul_ps(_mm_add_ps(window[i], window[WINDOW - 1 - i]), coeff[i]),
+        let last = width - 4;
+        let mut x = 0;
+        loop {
+            // The final vector may overlap its predecessor.
+            let column = x.min(last);
+            let mut y = 0;
+            while y + 4 <= outputs {
+                vertical_block::<4>(
+                    rows.as_ptr().add(y),
+                    k,
+                    column,
+                    out.add(y * out_stride + column),
+                    out_stride,
                 );
+                y += 4;
             }
-            acc
-        };
-        for dst in [out] {
-            // Complete vectors, then one overlapping vector for a short tail.
-            let last = width - 4;
-            let mut x = 0;
-            loop {
-                let column = x.min(last);
-                let mut y = 0;
-                while y + 4 <= outputs {
-                    let mut window = [_mm_set1_ps(0.0); WINDOW + 3];
-                    for (j, value) in window.iter_mut().enumerate() {
-                        *value = _mm_loadu_ps(rows[y + j].add(column));
-                    }
-                    for o in 0..4 {
-                        _mm_storeu_ps(
-                            dst.add((y + o) * out_stride + column),
-                            tap(&window[o..o + WINDOW]),
-                        );
-                    }
-                    y += 4;
-                }
-                while y < outputs {
-                    let mut window = [_mm_set1_ps(0.0); WINDOW];
-                    for (j, value) in window.iter_mut().enumerate() {
-                        *value = _mm_loadu_ps(rows[y + j].add(column));
-                    }
-                    _mm_storeu_ps(dst.add(y * out_stride + column), tap(&window));
-                    y += 1;
-                }
-                if column == last {
-                    break;
-                }
-                x += 4;
+            while y < outputs {
+                vertical_block::<1>(
+                    rows.as_ptr().add(y),
+                    k,
+                    column,
+                    out.add(y * out_stride + column),
+                    out_stride,
+                );
+                y += 1;
             }
+            if column == last {
+                break;
+            }
+            x += 4;
+        }
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn vertical_block<const N: usize>(
+    rows: *const *const f32,
+    k: &[f32; WINDOW],
+    x: usize,
+    out: *mut f32,
+    stride: usize,
+) {
+    // SAFETY: The region loop provides WINDOW + N - 1 valid row pointers,
+    // four readable samples per row at x, and N writable output vectors.
+    unsafe {
+        let load = |y: usize| _mm_loadu_ps(rows.add(y).read().add(x));
+        let center = _mm_set1_ps(k[RADIUS]);
+        let mut acc: [__m128; N] = std::array::from_fn(|y| _mm_mul_ps(load(y + RADIUS), center));
+        // Keep only the output accumulators live across taps.
+        for i in (0..RADIUS).rev() {
+            let coeff = _mm_set1_ps(k[i]);
+            for (y, acc) in acc.iter_mut().enumerate() {
+                let pair = _mm_add_ps(load(y + i), load(y + WINDOW - 1 - i));
+                *acc = _mm_add_ps(*acc, _mm_mul_ps(pair, coeff));
+            }
+        }
+        for (y, acc) in acc.into_iter().enumerate() {
+            _mm_storeu_ps(out.add(y * stride), acc);
         }
     }
 }

@@ -146,39 +146,36 @@ pub(crate) fn reduce(
 ) {
     assert!(w > 0 && h > 0 && src.len() == w * h);
     let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
-    ensure_len(tmp, w * nh);
+    ensure_len(tmp, w);
     ensure_len(dst, nw * nh);
-    let mut vertical = |y: usize, indices: [usize; 5]| {
+    let row = &mut tmp[..w];
+    let x_end = ((w - 1) / 2).max(1);
+    let mut reduce_row = |out: &mut [f32], indices: [usize; 5]| {
         let rows = indices.map(|sy| &src[sy * w..(sy + 1) * w]);
-        let out = &mut tmp[y * w..(y + 1) * w];
-        kernels.reduce_vertical(&rows, out);
+        kernels.reduce_vertical(&rows, row);
+        out[0] = reduce_border(row, 0);
+        if x_end > 1 {
+            kernels.reduce_horizontal(row, &mut out[1..x_end]);
+        }
+        for (x, dst) in out.iter_mut().enumerate().skip(x_end) {
+            *dst = reduce_border(row, x);
+        }
     };
     // Only the first and final output rows need reflection. Interior row
     // offsets are direct, and SIMD spans the entire row including its columns.
-    vertical(0, std::array::from_fn(|k| reflect(k as isize - 2, h)));
-    let end = ((h - 1) / 2).max(1);
-    for y in 1..end {
+    let y_end = ((h - 1) / 2).max(1);
+    let (interior, bottom) = dst[..nw * nh].split_at_mut(y_end * nw);
+    let (top, interior) = interior.split_at_mut(nw);
+    reduce_row(top, std::array::from_fn(|k| reflect(k as isize - 2, h)));
+    for (y, out) in (1..).zip(interior.chunks_exact_mut(nw)) {
         let sy = 2 * y;
-        vertical(y, [sy - 2, sy - 1, sy, sy + 1, sy + 2]);
+        reduce_row(out, [sy - 2, sy - 1, sy, sy + 1, sy + 2]);
     }
-    for y in end..nh {
-        vertical(
-            y,
+    for (y, out) in (y_end..).zip(bottom.chunks_exact_mut(nw)) {
+        reduce_row(
+            out,
             std::array::from_fn(|k| reflect((2 * y) as isize + k as isize - 2, h)),
         );
-    }
-    let end = ((w - 1) / 2).max(1);
-    for (row, out) in tmp[..w * nh]
-        .chunks_exact(w)
-        .zip(dst[..nw * nh].chunks_exact_mut(nw))
-    {
-        out[0] = reduce_border(row, 0);
-        if end > 1 {
-            kernels.reduce_horizontal(row, &mut out[1..end]);
-        }
-        for (x, dst) in out.iter_mut().enumerate().skip(end) {
-            *dst = reduce_border(row, x);
-        }
     }
 }
 
@@ -201,32 +198,50 @@ pub(crate) fn expand(
 ) {
     let (sw, sh) = (w.div_ceil(2), h.div_ceil(2));
     assert!(w > 0 && h > 0 && src.len() == sw * sh);
-    ensure_len(tmp, sw * h);
+    ensure_len(tmp, sw);
     ensure_len(dst, w * h);
-    // Generate even and odd rows in separate loops over pixels. Replication
-    // is resolved once per coarse row, rather than inside a pixel loop.
-    for (sy, pair) in tmp[..sw * h].chunks_mut(2 * sw).enumerate() {
-        let before = sy.saturating_sub(1);
-        let after = (sy + 1).min(sh - 1);
-        let rows = [before, sy, after].map(|r| &src[r * sw..(r + 1) * sw]);
-        let (out, odd) = pair.split_at_mut(sw);
-        kernels.expand_even(&rows, out);
-        if !odd.is_empty() {
-            let rows = [rows[1], rows[2]];
-            kernels.expand_odd(&rows, odd);
-        }
-    }
-    for (row, out) in tmp[..sw * h]
-        .chunks_exact(sw)
-        .zip(dst[..w * h].chunks_exact_mut(w))
-    {
+    expand_rows(src, 0, &mut dst[..w * h], w, tmp, kernels);
+}
+
+/// Expand whole output rows from a packed coarse plane. The first output row
+/// is even so each pair can reuse the same coarse source rows and scratch.
+pub(crate) fn expand_rows(
+    src: &[f32],
+    first_y: usize,
+    dst: &mut [f32],
+    w: usize,
+    tmp: &mut [f32],
+    kernels: &Kernels,
+) {
+    let sw = w.div_ceil(2);
+    debug_assert!(w > 0 && dst.len().is_multiple_of(w));
+    debug_assert!(src.len().is_multiple_of(sw) && first_y.is_multiple_of(2));
+    let sh = src.len() / sw;
+    let row = &mut tmp[..sw];
+    let end = sw - 1;
+    let horizontal = |row: &[f32], out: &mut [f32]| {
         expand_border(row, 0, out);
-        let end = sw.saturating_sub(1);
         if end > 1 {
             kernels.expand_horizontal(row, &mut out[2..2 * end]);
         }
         if end > 0 {
             expand_border(row, end, out);
+        }
+    };
+    // Resolve edge replication once per coarse row and consume each vertical
+    // result immediately so even and odd rows can share the same scratch.
+    for (offset, pair) in dst.chunks_mut(2 * w).enumerate() {
+        let sy = first_y / 2 + offset;
+        let before = sy.saturating_sub(1);
+        let after = (sy + 1).min(sh - 1);
+        let rows = [before, sy, after].map(|r| &src[r * sw..(r + 1) * sw]);
+        let (even, odd) = pair.split_at_mut(w);
+        kernels.expand_even(&rows, row);
+        horizontal(row, even);
+        if !odd.is_empty() {
+            let rows = [rows[1], rows[2]];
+            kernels.expand_odd(&rows, row);
+            horizontal(row, odd);
         }
     }
 }
@@ -385,6 +400,11 @@ mod tests {
                     reference_expand(&coarse, w, h, &mut expected, &mut tmp);
                     expand(&coarse, w, h, &mut actual, &mut tmp, &kernels);
                     assert_eq!(actual, expected, "expand {backend:?} {w}x{h}");
+                    actual.fill(f32::NAN);
+                    for (strip, out) in actual.chunks_mut(8 * w).enumerate() {
+                        expand_rows(&coarse, strip * 8, out, w, &mut tmp, &kernels);
+                    }
+                    assert_eq!(actual, expected, "expand rows {backend:?} {w}x{h}");
                 }
             }
         }

@@ -28,7 +28,7 @@
  */
 
 use crate::kernels::{
-    Contrast, Pool,
+    Contrast, POOL_TILE, Pool, PoolLanes,
     vector::{self, Vector},
 };
 use std::arch::aarch64::*;
@@ -38,25 +38,24 @@ struct Neon;
 
 // SAFETY: NEON has four f32 lanes and two f64 lanes per half. Entry points
 // enable NEON; checked slice lengths cover the unaligned loads and stores.
-unsafe impl Vector for Neon {
+unsafe impl Vector<4> for Neon {
     type F = float32x4_t;
     type E = int32x4_t;
     type D = float64x2_t;
-    const LANES: usize = 4;
     #[inline(always)]
     unsafe fn splat(v: f32) -> Self::F {
         // SAFETY: The caller enables NEON and satisfies the Vector lane contract.
         unsafe { vdupq_n_f32(v) }
     }
     #[inline(always)]
-    unsafe fn load(p: *const f32) -> Self::F {
+    unsafe fn load(chunk: &[f32; 4]) -> Self::F {
         // SAFETY: The caller enables NEON and satisfies the Vector lane contract.
-        unsafe { vld1q_f32(p) }
+        unsafe { vld1q_f32(chunk.as_ptr()) }
     }
     #[inline(always)]
-    unsafe fn store(p: *mut f32, v: Self::F) {
+    unsafe fn store(chunk: &mut [f32; 4], v: Self::F) {
         // SAFETY: The caller enables NEON and satisfies the Vector lane contract.
-        unsafe { vst1q_f32(p, v) }
+        unsafe { vst1q_f32(chunk.as_mut_ptr(), v) }
     }
     #[inline(always)]
     unsafe fn add(a: Self::F, b: Self::F) -> Self::F {
@@ -72,6 +71,11 @@ unsafe impl Vector for Neon {
     unsafe fn mul(a: Self::F, b: Self::F) -> Self::F {
         // SAFETY: The caller enables NEON and satisfies the Vector lane contract.
         unsafe { vmulq_f32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn mul_add(a: Self::F, b: Self::F, c: Self::F) -> Self::F {
+        // SAFETY: The caller enables NEON.
+        unsafe { vfmaq_f32(c, a, b) }
     }
     #[inline(always)]
     unsafe fn div(a: Self::F, b: Self::F) -> Self::F {
@@ -112,6 +116,21 @@ unsafe impl Vector for Neon {
     unsafe fn sum_d(value: Self::D) -> f64 {
         // SAFETY: The caller enables NEON and satisfies the Vector lane contract.
         unsafe { vaddvq_f64(value) }
+    }
+    #[inline(always)]
+    unsafe fn load_sums(row: &[f64; POOL_TILE]) -> (Self::D, Self::D) {
+        let (chunks, _) = row.as_chunks::<2>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe { (vld1q_f64(chunks[0].as_ptr()), vld1q_f64(chunks[1].as_ptr())) }
+    }
+    #[inline(always)]
+    unsafe fn store_sums(row: &mut [f64; POOL_TILE], lo: Self::D, hi: Self::D) {
+        let (chunks, _) = row.as_chunks_mut::<2>();
+        // SAFETY: The caller enables the ISA. Both chunks hold complete vectors.
+        unsafe {
+            vst1q_f64(chunks[0].as_mut_ptr(), lo);
+            vst1q_f64(chunks[1].as_mut_ptr(), hi);
+        }
     }
     #[inline(always)]
     unsafe fn decompose(x: Self::F) -> (Self::F, Self::E) {
@@ -157,8 +176,10 @@ unsafe impl Vector for Neon {
             let a = vcvt_f64_f32(vget_low_f32(value));
             let b = vcvt_high_f64_f32(value);
             let e = vdupq_n_f64(2.0 * (crate::kernels::EPSILON as f64));
-            *lo = vaddq_f64(*lo, vaddq_f64(vmulq_f64(a, a), vmulq_f64(a, e)));
-            *hi = vaddq_f64(*hi, vaddq_f64(vmulq_f64(b, b), vmulq_f64(b, e)));
+            // Both products are exact in f64 because the operands have f32
+            // precision. Add the rounded contribution to each sum separately.
+            *lo = vaddq_f64(*lo, vfmaq_f64(vmulq_f64(a, e), a, a));
+            *hi = vaddq_f64(*hi, vfmaq_f64(vmulq_f64(b, e), b, b));
         }
     }
 }
@@ -166,17 +187,19 @@ unsafe impl Vector for Neon {
 #[target_feature(enable = "neon")]
 pub(crate) fn contrast_neon(data: &mut Contrast<'_>) -> usize {
     // Dispatch validates all plane lengths and NEON availability.
-    vector::contrast::<Neon>(data)
+    vector::contrast::<Neon, 4>(data)
+}
+/// # Safety
+/// The caller must validate all regional plane lengths and strides and enable NEON.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn contrast_region_neon(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
+    // SAFETY: The caller meets the regional contrast kernel's requirements.
+    unsafe { vector::contrast_region::<Neon, 4>(data) }
 }
 #[target_feature(enable = "neon")]
-pub(crate) fn contrast_region_neon(data: &mut crate::kernels::ContrastRegion<'_>) -> usize {
-    // Dispatch validates strided planes, compact outputs and NEON availability.
-    vector::contrast_region::<Neon>(data)
-}
-#[target_feature(enable = "neon")]
-pub(crate) fn pool_neon(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) fn pool_neon(data: &Pool<'_>, lanes: &mut PoolLanes, last: bool) -> (usize, [f64; 3]) {
     // Dispatch validates all plane lengths and NEON availability.
-    vector::pool::<Neon>(data)
+    vector::pool::<Neon, 4>(data, lanes, last)
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]
@@ -186,7 +209,7 @@ pub(crate) fn pool_tiles_neon(
     stride: usize,
 ) {
     // Dispatch validates all strip strides, output lengths and NEON availability.
-    vector::pool_tiles::<Neon>(data, tiles, stride);
+    vector::pool_tiles::<Neon, 4>(data, tiles, stride);
 }
 #[target_feature(enable = "neon")]
 pub(crate) fn pool_parts_neon(
@@ -195,11 +218,11 @@ pub(crate) fn pool_parts_neon(
     stride: usize,
 ) {
     // Dispatch validates the strip strides, output length and CPU availability.
-    vector::pool_parts::<Neon>(data, parts, stride);
+    vector::pool_parts::<Neon, 4>(data, parts, stride);
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]
 pub(crate) fn powers_neon(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     // The test wrapper checks lengths, domain, and NEON availability.
-    vector::powers::<Neon>(input, output, exponent)
+    vector::powers::<Neon, 4>(input, output, exponent)
 }

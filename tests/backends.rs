@@ -90,6 +90,46 @@ fn all_available_backends_agree_for_padded_tails_and_display_extremes() {
 }
 
 #[test]
+fn identical_images_score_zero_across_preparation_and_comparison_backends() {
+    let metric = CvvdpLite::new(Display::standard_4k()).unwrap();
+    let (width, height) = (67, 33);
+    let pixels: Vec<u8> = (0..width * height * 3)
+        .map(|i| (i * 71 + i / (width * 3) * 53) as u8)
+        .collect();
+    let floats: Vec<f32> = pixels.iter().map(|&v| f32::from(v) / 255.0).collect();
+    let (rgb, _) = floats.as_chunks::<3>();
+    let linear: [Vec<f32>; 3] = std::array::from_fn(|c| rgb.iter().map(|pixel| pixel[c]).collect());
+    let images = [
+        RgbImage::srgb8(&pixels, width, height, width * 3).unwrap(),
+        RgbImage::srgb_f32(&floats, width, height, width * 3).unwrap(),
+        RgbImage::linear_rgb(linear.each_ref().map(Vec::as_slice), width, height, width).unwrap(),
+    ];
+    let backends: Vec<_> = [Backend::Scalar, Backend::Neon, Backend::Avx2, Backend::Sse2]
+        .into_iter()
+        .filter(|backend| backend.is_available())
+        .collect();
+    for (format, image) in images.into_iter().enumerate() {
+        for &prepare in &backends {
+            let mut workspace = Workspace::with_backend(prepare).unwrap();
+            let reference = metric
+                .prepare_reference_with(image, &mut workspace)
+                .unwrap();
+            for &compare in &backends {
+                let score = Workspace::with_backend(compare)
+                    .unwrap()
+                    .compare(&reference, image)
+                    .unwrap();
+                assert_eq!(
+                    (score.jod, score.distortion),
+                    (10.0, 0.0),
+                    "image format {format}, {prepare:?} reference and {compare:?} comparison"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unavailable_backend_is_rejected_without_entering_cpu_instructions() {
     for backend in [Backend::Neon, Backend::Avx2, Backend::Sse2] {
         if !backend.is_available() {

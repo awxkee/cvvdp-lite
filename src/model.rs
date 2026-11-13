@@ -28,7 +28,10 @@
  */
 
 use crate::{
-    Backend, Error, RgbImage, blur::GaussianBlur, image::RgbToDkl, kernels, pyramid, tables,
+    Backend, Error, RgbImage,
+    blur::{GaussianBlur, MASK_STRIP_ROWS, RADIUS, blur_active},
+    image::RgbToDkl,
+    kernels, pyramid, tables,
 };
 use kernels::{EPSILON, MASK_P, MASK_Q};
 
@@ -139,100 +142,127 @@ impl CvvdpLite {
         self.prepare_reference_with(image, &mut Workspace::new())
     }
 
+    /// Prepare a reference with one sensitivity coordinate per pixel.
+    ///
+    /// Scoring reconstructs the three channel sensitivities from the stored
+    /// coordinate. This saves reference memory and adds work to each comparison.
+    pub fn prepare_reference_compact(
+        &self,
+        image: RgbImage<'_>,
+    ) -> Result<PreparedReference, Error> {
+        self.prepare_reference_compact_with(image, &mut Workspace::new())
+    }
+
     /// Prepare a new immutable reference using reusable analysis scratch space.
-    /// The workspace may also be reused for subsequent candidate comparisons.
+    /// Call [`Workspace::reserve`] or attach it with [`PreparedReference::evaluator_with`]
+    /// to reserve scratch for subsequent candidate comparisons.
     pub fn prepare_reference_with(
         &self,
         image: RgbImage<'_>,
         workspace: &mut Workspace,
     ) -> Result<PreparedReference, Error> {
-        workspace.reserve_analysis(image.width, image.height)?;
+        self.prepare_reference_impl(image, workspace, false)
+    }
+
+    /// Prepare a compact reference using reusable analysis scratch space.
+    pub fn prepare_reference_compact_with(
+        &self,
+        image: RgbImage<'_>,
+        workspace: &mut Workspace,
+    ) -> Result<PreparedReference, Error> {
+        self.prepare_reference_impl(image, workspace, true)
+    }
+
+    fn prepare_reference_impl(
+        &self,
+        image: RgbImage<'_>,
+        workspace: &mut Workspace,
+        compact: bool,
+    ) -> Result<PreparedReference, Error> {
         let Workspace {
-            current,
-            next,
-            expanded,
+            mask: expansion,
             tmp,
             pyramid: pyramid_kernels,
             conversion,
             ..
         } = workspace;
+        let (mut w, mut h) = (image.width, image.height);
+        let height = pyramid_height(w, h, self.display.pixels_per_degree);
+        let mut current = std::array::from_fn(|_| Vec::new());
+        // Decode into the first band's final contrast buffers.
         image.to_dkl(
             self.display.scale(),
             self.display.black(),
-            current,
+            &mut current,
             conversion,
         )?;
-        let height = pyramid_height(image.width, image.height, self.display.pixels_per_degree);
-        let (mut w, mut h) = (image.width, image.height);
-        let mut bands = Vec::with_capacity(height + 1);
-        for level in 0..=height {
-            let base = level == height;
-            let frequency = if base {
-                0.1
-            } else {
-                band_frequency(level, self.display.pixels_per_degree)
-            };
-            let csf = csf_at_frequency(frequency);
-            let count = w * h;
-            let mut contrast: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0.0; count]);
-            let mut sensitivity: [Vec<f32>; 3] =
-                std::array::from_fn(|_| vec![0.0; if base { 1 } else { count }]);
-            if base {
-                let bg = mean_luminance(&current[0][..count]);
-                let s = csf_at_luminance(&csf, bg);
-                let inv_bg = 1.0 / bg;
-                for c in 0..3 {
-                    sensitivity[c][0] = s[c];
-                    for (i, v) in current[c][..count].iter().enumerate() {
-                        contrast[c][i] = (*v * inv_bg).min(1000.0) * s[c];
-                    }
-                }
-            } else {
-                for c in 0..3 {
-                    pyramid::reduce(
-                        &current[c][..count],
-                        w,
-                        h,
-                        &mut next[c],
-                        tmp,
-                        pyramid_kernels,
-                    );
-                    pyramid::expand(
-                        &next[c][..w.div_ceil(2) * h.div_ceil(2)],
-                        w,
-                        h,
-                        &mut expanded[c],
-                        tmp,
-                        pyramid_kernels,
-                    );
-                }
-                let band_scale = if level == 0 { 1.0 } else { 2.0 };
-                for i in 0..count {
-                    let bg = expanded[0][i].max(0.01);
-                    let s = csf_at_luminance(&csf, bg);
-                    let inv_bg = 1.0 / bg;
-                    for c in 0..3 {
-                        sensitivity[c][i] = s[c] * CH_GAIN[c];
-                        contrast[c][i] = ((current[c][i] - expanded[c][i]) * inv_bg).min(1000.0)
-                            * band_scale
-                            * sensitivity[c][i];
-                    }
-                }
-                std::mem::swap(current, next);
+        if compact && height > 0 {
+            for plane in &mut *expansion {
+                pyramid::ensure_len(plane, w * h.min(MASK_STRIP_ROWS));
             }
+        }
+        let mut bands = Vec::with_capacity(height + 1);
+        for level in 0..height {
+            let frequency = band_frequency(level, self.display.pixels_per_degree);
+            let count = w * h;
+            let mut next = std::array::from_fn(|_| Vec::new());
+            // Finish reduction before replacing the Gaussian samples with contrast.
+            reduce_planes(&current, &mut next, w, h, tmp, pyramid_kernels);
+            let scale = if level == 0 { 1.0 } else { 2.0 };
+            let csf = csf_at_frequency(frequency);
+            let sensitivity = if compact {
+                let mut positions = vec![0.0; count];
+                for y in (0..h).step_by(MASK_STRIP_ROWS) {
+                    let end = (y + MASK_STRIP_ROWS).min(h);
+                    let pixels = y * w..end * w;
+                    let len = pixels.len();
+                    expand_strip(&next, expansion, (w, h), y..end, tmp, pyramid_kernels);
+                    weight_reference(
+                        current.each_mut().map(|v| &mut v[pixels.clone()]),
+                        expansion.each_mut().map(|v| &mut v[..len]),
+                        &csf,
+                        scale,
+                        Some(&mut positions[pixels]),
+                    );
+                }
+                BandSensitivity::Compact {
+                    positions,
+                    csf: Box::new(csf),
+                }
+            } else {
+                // The expansion is replaced with sensitivities as it is read.
+                let mut planes = std::array::from_fn(|_| Vec::new());
+                for (coarse, plane) in next.iter().zip(&mut planes) {
+                    pyramid::expand(coarse, w, h, plane, tmp, pyramid_kernels);
+                }
+                weight_reference(
+                    current.each_mut().map(Vec::as_mut_slice),
+                    planes.each_mut().map(Vec::as_mut_slice),
+                    &csf,
+                    scale,
+                    None,
+                );
+                BandSensitivity::Dense(planes)
+            };
             bands.push(ReferenceBand {
                 w,
                 h,
                 frequency,
-                contrast,
+                contrast: current,
                 sensitivity,
             });
+            current = next;
             w = w.div_ceil(2);
             h = h.div_ceil(2);
         }
-        if height % 2 == 1 {
-            std::mem::swap(current, next);
-        }
+        let weights = weight_base_reference(&mut current, w * h);
+        bands.push(ReferenceBand {
+            w,
+            h,
+            frequency: 0.1,
+            contrast: current,
+            sensitivity: BandSensitivity::Base(weights),
+        });
         Ok(PreparedReference {
             width: image.width,
             height: image.height,
@@ -241,12 +271,82 @@ impl CvvdpLite {
         })
     }
 
-    /// One-shot comparison. For multiple candidates use prepare_reference.
+    /// Compare one pair of images without caching the reference bands.
+    /// For multiple candidates use [`Self::prepare_reference`].
     pub fn compare(&self, reference: RgbImage<'_>, test: RgbImage<'_>) -> Result<Score, Error> {
         if reference.width != test.width || reference.height != test.height {
             return Err(Error::DimensionMismatch);
         }
-        self.prepare_reference(reference)?.evaluator().compare(test)
+        let (mut w, mut h) = (reference.width, reference.height);
+        let height = pyramid_height(w, h, self.display.pixels_per_degree);
+        let mut workspace = Workspace::new();
+        let mut reference_current = std::array::from_fn(|_| Vec::new());
+        let mut reference_next = std::array::from_fn(|_| Vec::new());
+        let scale = self.display.scale();
+        let black = self.display.black();
+        reference.to_dkl(
+            scale,
+            black,
+            &mut reference_current,
+            &mut workspace.conversion,
+        )?;
+        test.to_dkl(
+            scale,
+            black,
+            &mut workspace.current,
+            &mut workspace.conversion,
+        )?;
+
+        let strip_len = if height == 0 {
+            0
+        } else {
+            workspace.reserve(w, h)?;
+            w * h.min(MASK_STRIP_ROWS)
+        };
+        let mut sensitivity = std::array::from_fn(|_| vec![0.0; strip_len]);
+        let mut per_channel = [0.0; 3];
+        for level in 0..height {
+            reduce_planes(
+                &reference_current,
+                &mut reference_next,
+                w,
+                h,
+                &mut workspace.tmp,
+                &workspace.pyramid,
+            );
+            reduce_planes(
+                &workspace.current,
+                &mut workspace.next,
+                w,
+                h,
+                &mut workspace.tmp,
+                &workspace.pyramid,
+            );
+            let csf = csf_at_frequency(band_frequency(level, self.display.pixels_per_degree));
+            let band_scale = if level == 0 { 1.0 } else { 2.0 };
+            let squares = workspace.pool_band(
+                w,
+                h,
+                BandReference::OneShot {
+                    current: &mut reference_current,
+                    next: &reference_next,
+                    sensitivity: &mut sensitivity,
+                    csf: &csf,
+                },
+                band_scale,
+            );
+            accumulate_band(&mut per_channel, band_rms(squares, w * h), false);
+            std::mem::swap(&mut reference_current, &mut reference_next);
+            std::mem::swap(&mut workspace.current, &mut workspace.next);
+            w = w.div_ceil(2);
+            h = h.div_ceil(2);
+        }
+
+        let count = w * h;
+        let weights = weight_base_reference(&mut reference_current, count);
+        let squares = pool_baseband(&workspace.current, &reference_current, weights, count);
+        accumulate_band(&mut per_channel, band_rms(squares, count), true);
+        Ok(finish_score(per_channel))
     }
 }
 
@@ -255,7 +355,162 @@ pub(crate) struct ReferenceBand {
     pub(crate) h: usize,
     frequency: f32,
     pub(crate) contrast: [Vec<f32>; 3],
-    pub(crate) sensitivity: [Vec<f32>; 3],
+    sensitivity: BandSensitivity,
+}
+
+enum BandSensitivity {
+    Base([f32; 3]),
+    Dense([Vec<f32>; 3]),
+    Compact {
+        positions: Vec<f32>,
+        csf: Box<[[f32; 32]; 3]>,
+    },
+}
+
+impl BandSensitivity {
+    fn allocated_bytes(&self) -> usize {
+        match self {
+            Self::Base(_) => 0,
+            Self::Dense(planes) => planes.iter().map(|p| p.capacity() * size_of::<f32>()).sum(),
+            Self::Compact { positions, csf } => {
+                positions.capacity() * size_of::<f32>() + size_of_val(csf.as_ref())
+            }
+        }
+    }
+}
+
+impl ReferenceBand {
+    pub(crate) fn base_weights(&self) -> [f32; 3] {
+        let BandSensitivity::Base(weights) = self.sensitivity else {
+            unreachable!("base weights are only available for the baseband");
+        };
+        weights
+    }
+
+    pub(crate) fn dense_sensitivity(&self) -> Option<&[Vec<f32>; 3]> {
+        match &self.sensitivity {
+            BandSensitivity::Dense(planes) => Some(planes),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn decode_sensitivity(&self, range: std::ops::Range<usize>, out: [&mut [f32]; 3]) {
+        let BandSensitivity::Compact { positions, csf } = &self.sensitivity else {
+            unreachable!("only compact bands have coordinates to decode");
+        };
+        decode_weights(csf, &positions[range], out);
+    }
+}
+
+enum BandReference<'a> {
+    Prepared(&'a ReferenceBand),
+    OneShot {
+        current: &'a mut [Vec<f32>; 3],
+        next: &'a [Vec<f32>; 3],
+        sensitivity: &'a mut [Vec<f32>; 3],
+        csf: &'a [[f32; 32]; 3],
+    },
+}
+
+impl BandReference<'_> {
+    fn prepare_strip(
+        &mut self,
+        dimensions: (usize, usize),
+        rows: std::ops::Range<usize>,
+        scale: f32,
+        tmp: &mut [f32],
+        kernels: &pyramid::Kernels,
+    ) {
+        if let Self::OneShot {
+            current,
+            next,
+            sensitivity,
+            csf,
+        } = self
+        {
+            let w = dimensions.0;
+            let first = rows.start * w;
+            let len = rows.len() * w;
+            expand_strip(next, sensitivity, dimensions, rows, tmp, kernels);
+            // Reduction has finished, so the Gaussian plane can hold the
+            // weighted contrast until pooling consumes it after mask blur.
+            weight_reference(
+                current.each_mut().map(|v| &mut v[first..first + len]),
+                sensitivity.each_mut().map(|v| &mut v[..len]),
+                csf,
+                scale,
+                None,
+            );
+        }
+    }
+
+    fn contrast(&self, range: std::ops::Range<usize>) -> [&[f32]; 3] {
+        let planes = match self {
+            Self::Prepared(band) => &band.contrast,
+            Self::OneShot { current, .. } => current,
+        };
+        planes.each_ref().map(|v| &v[range.clone()])
+    }
+
+    fn apply_contrast(
+        &self,
+        backend: Backend,
+        current: [&mut [f32]; 3],
+        mask: [&mut [f32]; 3],
+        range: std::ops::Range<usize>,
+        scale: f32,
+    ) {
+        let reference = self.contrast(range.clone());
+        match self {
+            Self::Prepared(band) => {
+                if let Some(planes) = band.dense_sensitivity() {
+                    kernels::contrast(
+                        backend,
+                        current,
+                        mask,
+                        planes.each_ref().map(|v| &v[range.clone()]),
+                        reference,
+                        scale,
+                    );
+                } else {
+                    // Keep the original flattened SIMD boundaries, including the
+                    // scalar tail at the end of the band.
+                    const CHUNK: usize = 1024;
+                    let mut weights = [[0.0; CHUNK]; 3];
+                    let [a, b, c] = current;
+                    let [m0, m1, m2] = mask;
+                    for start in (0..range.len()).step_by(CHUNK) {
+                        let end = (start + CHUNK).min(range.len());
+                        let len = end - start;
+                        band.decode_sensitivity(
+                            range.start + start..range.start + end,
+                            weights.each_mut().map(|v| &mut v[..len]),
+                        );
+                        kernels::contrast(
+                            backend,
+                            [&mut a[start..end], &mut b[start..end], &mut c[start..end]],
+                            [
+                                &mut m0[start..end],
+                                &mut m1[start..end],
+                                &mut m2[start..end],
+                            ],
+                            weights.each_ref().map(|v| &v[..len]),
+                            reference.map(|v| &v[start..end]),
+                            scale,
+                        );
+                    }
+                }
+            }
+            Self::OneShot { sensitivity, .. } => kernels::contrast(
+                backend,
+                current,
+                mask,
+                sensitivity.each_ref().map(|v| &v[..range.len()]),
+                reference,
+                scale,
+            ),
+        }
+    }
 }
 
 /// Immutable cached reference; may be shared among independent evaluators.
@@ -285,8 +540,13 @@ impl PreparedReference {
             + self
                 .bands
                 .iter()
-                .flat_map(|b| b.contrast.iter().chain(&b.sensitivity))
-                .map(|v| v.capacity() * std::mem::size_of::<f32>())
+                .map(|band| {
+                    band.contrast
+                        .iter()
+                        .map(|v| v.capacity() * size_of::<f32>())
+                        .sum::<usize>()
+                        + band.sensitivity.allocated_bytes()
+                })
                 .sum::<usize>()
     }
 
@@ -363,17 +623,13 @@ pub struct Workspace {
     backend: Backend,
     current: [Vec<f32>; 3],
     next: [Vec<f32>; 3],
-    expanded: [Vec<f32>; 3],
+    // One strip of expanded samples, reused for raw and blurred masks.
     mask: [Vec<f32>; 3],
     tmp: Vec<f32>,
     blur: GaussianBlur,
     pyramid: pyramid::Kernels,
     conversion: RgbToDkl,
-    mask_c: f32,
-    dmax: f32,
-    mask_zero: [f32; 3],
-    diff_zero: f32,
-    xcm: [[f32; 3]; 3],
+    mask_parameters: kernels::MaskParameters,
     band_scores: Vec<BandScore>,
 }
 
@@ -395,26 +651,16 @@ impl Workspace {
             return Err(Error::UnsupportedBackend);
         }
         kernels::warmup(backend);
-        let xcm_log = [
-            [-0.18950105, -5.962151, -4.318346],
-            [2.5655594, 0.34406713, -2.7196465],
-            [3.8118372, -1.0051706, -0.51933765],
-        ];
         Ok(Self {
             backend,
             current: std::array::from_fn(|_| Vec::new()),
             next: std::array::from_fn(|_| Vec::new()),
-            expanded: std::array::from_fn(|_| Vec::new()),
             mask: std::array::from_fn(|_| Vec::new()),
             tmp: Vec::new(),
             blur: GaussianBlur::new(backend),
             pyramid: pyramid::Kernels::for_backend(backend),
             conversion: RgbToDkl::new(backend),
-            mask_c: 10.0_f32.powf(-0.7954971),
-            dmax: 10.0_f32.powf(2.5642455),
-            mask_zero: MASK_Q.map(|q| EPSILON.powf(q)),
-            diff_zero: EPSILON.powf(MASK_P),
-            xcm: xcm_log.map(|row| row.map(|v| 2.0_f32.powf(v))),
+            mask_parameters: mask_parameters(),
             band_scores: Vec::with_capacity(15),
         })
     }
@@ -426,25 +672,23 @@ impl Workspace {
     /// Grow storage for an image. Buffers never shrink, and ping-pong storage
     /// returns to its initial orientation after every comparison/preparation.
     pub fn reserve(&mut self, width: usize, height: usize) -> Result<(), Error> {
-        let count = self.reserve_analysis(width, height)?;
+        self.reserve_analysis(width, height)?;
         for plane in &mut self.mask {
-            pyramid::ensure_len(plane, count);
+            pyramid::ensure_len(plane, width * height.min(MASK_STRIP_ROWS));
         }
         self.blur.reserve(width, height);
         Ok(())
     }
 
-    fn reserve_analysis(&mut self, width: usize, height: usize) -> Result<usize, Error> {
+    fn reserve_analysis(&mut self, width: usize, height: usize) -> Result<(), Error> {
         let count = crate::image::pixel_count(width, height)?;
         let next_count = width.div_ceil(2) * height.div_ceil(2);
         for c in 0..3 {
             pyramid::ensure_len(&mut self.current[c], count);
             pyramid::ensure_len(&mut self.next[c], next_count);
-            pyramid::ensure_len(&mut self.expanded[c], count);
         }
-        let tmp_count = (width * height.div_ceil(2)).max(width.div_ceil(2) * height);
-        pyramid::ensure_len(&mut self.tmp, tmp_count);
-        Ok(count)
+        pyramid::ensure_len(&mut self.tmp, width);
+        Ok(())
     }
 
     /// Heap bytes retained by scratch buffers (excluding allocator overhead).
@@ -452,7 +696,6 @@ impl Workspace {
         self.current
             .iter()
             .chain(&self.next)
-            .chain(&self.expanded)
             .chain(&self.mask)
             .chain([&self.tmp])
             .map(|v| v.capacity() * std::mem::size_of::<f32>())
@@ -490,66 +733,19 @@ impl Workspace {
             let (w, h, count) = (band.w, band.h, band.w * band.h);
             let base = level == reference.bands.len() - 1;
             let squares = if base {
-                let inv_bg = 1.0 / mean_luminance(&self.current[0][..count]);
-                let mut sums = [0.0_f64; 3];
-                for (c, sum) in sums.iter_mut().enumerate() {
-                    let sensitivity = band.sensitivity[c][0];
-                    for i in 0..count {
-                        let d = ((self.current[c][i] * inv_bg).min(1000.0) * sensitivity
-                            - band.contrast[c][i])
-                            .abs() as f64;
-                        *sum += d * d + 2.0 * (EPSILON as f64) * d;
-                    }
-                }
-                sums
+                let weights = band.base_weights();
+                pool_baseband(&self.current, &band.contrast, weights, count)
             } else {
-                let next_count = w.div_ceil(2) * h.div_ceil(2);
-                for c in 0..3 {
-                    pyramid::reduce(
-                        &self.current[c][..count],
-                        w,
-                        h,
-                        &mut self.next[c],
-                        &mut self.tmp,
-                        &self.pyramid,
-                    );
-                    pyramid::expand(
-                        &self.next[c][..next_count],
-                        w,
-                        h,
-                        &mut self.expanded[c],
-                        &mut self.tmp,
-                        &self.pyramid,
-                    );
-                }
+                reduce_planes(
+                    &self.current,
+                    &mut self.next,
+                    w,
+                    h,
+                    &mut self.tmp,
+                    &self.pyramid,
+                );
                 let band_scale = if level == 0 { 1.0 } else { 2.0 };
-                let [a, b, c] = &mut self.current;
-                let [m0, m1, m2] = &mut self.mask;
-                kernels::contrast(
-                    self.backend,
-                    [&mut a[..count], &mut b[..count], &mut c[..count]],
-                    self.expanded.each_ref().map(|v| &v[..count]),
-                    band.sensitivity.each_ref().map(|v| v.as_slice()),
-                    band.contrast.each_ref().map(|v| v.as_slice()),
-                    [&mut m0[..count], &mut m1[..count], &mut m2[..count]],
-                    band_scale,
-                );
-                for c in 0..3 {
-                    self.blur.blur(&mut self.mask[c][..count], w, h);
-                }
-                let sums = kernels::pool(
-                    self.backend,
-                    self.current.each_ref().map(|v| &v[..count]),
-                    band.contrast.each_ref().map(|v| v.as_slice()),
-                    self.mask.each_ref().map(|v| &v[..count]),
-                    kernels::MaskParameters {
-                        mask_c: self.mask_c,
-                        dmax: self.dmax,
-                        mask_zero: self.mask_zero,
-                        diff_zero: self.diff_zero,
-                        xcm: self.xcm,
-                    },
-                );
+                let sums = self.pool_band(w, h, BandReference::Prepared(band), band_scale);
                 std::mem::swap(&mut self.current, &mut self.next);
                 sums
             };
@@ -569,6 +765,186 @@ impl Workspace {
         }
         Ok(finish_score(per_channel))
     }
+
+    fn pool_band(
+        &mut self,
+        w: usize,
+        h: usize,
+        mut band: BandReference<'_>,
+        scale: f32,
+    ) -> [f64; 3] {
+        let blur = blur_active(w, h);
+        let halo = if blur { RADIUS } else { 0 };
+        let mut pool = kernels::PoolAccumulator::new(self.backend, self.mask_parameters);
+        let mut mask_end = 0;
+        for y in (0..h).step_by(MASK_STRIP_ROWS) {
+            let end = (y + MASK_STRIP_ROWS).min(h);
+            // Compute each raw mask once. Inserting the next strip covers the
+            // vertical halo and keeps the previously filtered rows in the ring.
+            while mask_end < (end + halo).min(h) {
+                let next = (mask_end + MASK_STRIP_ROWS).min(h);
+                self.mask_strip(&mut band, (w, h), scale, mask_end..next);
+                if blur {
+                    let len = (next - mask_end) * w;
+                    self.blur.horizontal_mask_rows(
+                        self.mask.each_ref().map(|v| &v[..len]),
+                        mask_end,
+                        w,
+                    );
+                }
+                mask_end = next;
+            }
+            let range = y * w..end * w;
+            let len = range.len();
+            if blur {
+                self.blur
+                    .vertical_mask_rows(self.mask.each_mut().map(|v| &mut v[..len]), y, w, h);
+            }
+            let current = self.current.each_ref().map(|v| &v[range.clone()]);
+            let reference = band.contrast(range);
+            let masks = self.mask.each_ref().map(|v| &v[..len]);
+            if end == h {
+                return pool.finish(current, reference, masks);
+            }
+            pool.push(current, reference, masks);
+        }
+        unreachable!("a band always has at least one row")
+    }
+
+    fn mask_strip(
+        &mut self,
+        band: &mut BandReference<'_>,
+        dimensions: (usize, usize),
+        scale: f32,
+        rows: std::ops::Range<usize>,
+    ) {
+        band.prepare_strip(
+            dimensions,
+            rows.clone(),
+            scale,
+            &mut self.tmp,
+            &self.pyramid,
+        );
+        let w = dimensions.0;
+        let range = rows.start * w..rows.end * w;
+        let len = range.len();
+        expand_strip(
+            &self.next,
+            &mut self.mask,
+            dimensions,
+            rows,
+            &mut self.tmp,
+            &self.pyramid,
+        );
+        band.apply_contrast(
+            self.backend,
+            self.current.each_mut().map(|v| &mut v[range.clone()]),
+            self.mask.each_mut().map(|v| &mut v[..len]),
+            range,
+            scale,
+        );
+    }
+}
+
+fn reduce_planes(
+    current: &[Vec<f32>; 3],
+    next: &mut [Vec<f32>; 3],
+    w: usize,
+    h: usize,
+    tmp: &mut Vec<f32>,
+    kernels: &pyramid::Kernels,
+) {
+    for (src, dst) in current.iter().zip(next) {
+        pyramid::reduce(&src[..w * h], w, h, dst, tmp, kernels);
+    }
+}
+
+fn expand_strip(
+    coarse: &[Vec<f32>; 3],
+    output: &mut [Vec<f32>; 3],
+    (w, h): (usize, usize),
+    rows: std::ops::Range<usize>,
+    tmp: &mut [f32],
+    kernels: &pyramid::Kernels,
+) {
+    let coarse_len = w.div_ceil(2) * h.div_ceil(2);
+    let len = rows.len() * w;
+    for (coarse, output) in coarse.iter().zip(output) {
+        pyramid::expand_rows(
+            &coarse[..coarse_len],
+            rows.start,
+            &mut output[..len],
+            w,
+            tmp,
+            kernels,
+        );
+    }
+}
+
+#[inline]
+fn weighted_contrast(value: f32, expanded: f32, inv_bg: f32, scale: f32, weight: f32) -> f32 {
+    ((value - expanded) * inv_bg).min(1000.0) * scale * weight
+}
+
+#[inline]
+fn weight_reference(
+    current: [&mut [f32]; 3],
+    mut expanded: [&mut [f32]; 3],
+    csf: &[[f32; 32]; 3],
+    scale: f32,
+    mut positions: Option<&mut [f32]>,
+) {
+    for i in 0..current[0].len() {
+        let bg = expanded[0][i].max(0.01);
+        let position = csf_position(bg);
+        let weights = band_weights(csf, position);
+        let inv_bg = 1.0 / bg;
+        for c in 0..3 {
+            current[c][i] =
+                weighted_contrast(current[c][i], expanded[c][i], inv_bg, scale, weights[c]);
+        }
+        if let Some(positions) = &mut positions {
+            positions[i] = position;
+        } else {
+            for (plane, weight) in expanded.iter_mut().zip(weights) {
+                plane[i] = weight;
+            }
+        }
+    }
+}
+
+fn weight_base_reference(current: &mut [Vec<f32>; 3], count: usize) -> [f32; 3] {
+    let bg = mean_luminance(&current[0][..count]);
+    let inv_bg = 1.0 / bg;
+    let weights = csf_at_position(&csf_at_frequency(0.1), csf_position(bg));
+    for (plane, weight) in current.iter_mut().zip(weights) {
+        for sample in &mut plane[..count] {
+            *sample = base_contrast(*sample, inv_bg, weight);
+        }
+    }
+    weights
+}
+
+#[inline]
+fn base_contrast(value: f32, inv_bg: f32, weight: f32) -> f32 {
+    (value * inv_bg).min(1000.0) * weight
+}
+
+pub(crate) fn pool_baseband(
+    current: &[Vec<f32>; 3],
+    reference: &[Vec<f32>; 3],
+    weights: [f32; 3],
+    count: usize,
+) -> [f64; 3] {
+    let inv_bg = 1.0 / mean_luminance(&current[0][..count]);
+    std::array::from_fn(|c| {
+        let mut sum = 0.0;
+        for (&value, &reference) in current[c][..count].iter().zip(&reference[c][..count]) {
+            let d = (base_contrast(value, inv_bg, weights[c]) - reference).abs() as f64;
+            sum += d * d + 2.0 * (EPSILON as f64) * d;
+        }
+        sum
+    })
 }
 
 /// Regularized RMS of one band's pooled squares.
@@ -661,14 +1037,31 @@ fn csf_at_frequency(frequency: f32) -> [[f32; 32]; 3] {
     })
 }
 
-fn csf_at_luminance(csf: &[[f32; 32]; 3], luminance: f32) -> [f32; 3] {
-    let pos = ((luminance.log10() - tables::LOG_LUMINANCE[0]) * 31.0
+#[inline]
+fn csf_position(luminance: f32) -> f32 {
+    ((luminance.log10() - tables::LOG_LUMINANCE[0]) * 31.0
         / (tables::LOG_LUMINANCE[31] - tables::LOG_LUMINANCE[0]))
-        .clamp(0.0, 31.0);
+        .clamp(0.0, 31.0)
+}
+
+#[inline]
+fn csf_at_position(csf: &[[f32; 32]; 3], pos: f32) -> [f32; 3] {
     let index = (pos as usize).min(30);
     let t = pos - index as f32;
     let correction = 10.0_f32.powf(-0.27974233 / 20.0);
     std::array::from_fn(|c| {
         10.0_f32.powf(csf[c][index] * (1.0 - t) + csf[c][index + 1] * t) * correction
     })
+}
+
+#[inline]
+fn band_weights(csf: &[[f32; 32]; 3], position: f32) -> [f32; 3] {
+    let weights = csf_at_position(csf, position);
+    std::array::from_fn(|c| weights[c] * CH_GAIN[c])
+}
+
+fn decode_weights(csf: &[[f32; 32]; 3], positions: &[f32], [a, b, c]: [&mut [f32]; 3]) {
+    for ((&position, a), (b, c)) in positions.iter().zip(a).zip(b.iter_mut().zip(c)) {
+        [*a, *b, *c] = band_weights(csf, position);
+    }
 }

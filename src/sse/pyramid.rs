@@ -110,28 +110,21 @@ pub(crate) fn expand_odd_sse2(rows: &Rows<'_, 2>, dst: &mut [f32]) -> usize {
 pub(crate) fn reduce_horizontal_sse2(src: &[f32], dst: &mut [f32]) -> usize {
     assert!(src.len() >= 2 * dst.len() + 3);
     // Deinterleaving reads one extra odd sample beyond the final outer tap.
-    // Keep that load inside src; a final vector without the sample uses tails.
-    let done = dst.len().min(src.len().saturating_sub(4) / 2) / 4 * 4;
-    // SAFETY: SSE2 is enabled, and done accounts for both complete
-    // deinterleaving loads through the furthest shifted input and every store.
-    unsafe {
-        let taps = src.array_windows::<12>().step_by(8);
-        for (taps, dst) in taps.zip(dst[..done].as_chunks_mut::<4>().0) {
-            let p = taps.as_ptr();
-            let (a, b) = deinterleave(p);
-            let (c, d) = deinterleave(p.add(2));
-            let (e, _) = deinterleave(p.add(4));
-            let value = _mm_add_ps(
-                _mm_add_ps(
-                    _mm_mul_ps(_mm_add_ps(a, e), _mm_set1_ps(0.05)),
-                    _mm_mul_ps(_mm_add_ps(b, d), _mm_set1_ps(0.25)),
-                ),
-                _mm_mul_ps(c, _mm_set1_ps(0.4)),
-            );
-            _mm_storeu_ps(dst.as_mut_ptr(), value);
-        }
+    let groups = dst.len().min(src.len().saturating_sub(4) / 2) / 4;
+    let (groups_out, _) = dst[..4 * groups].as_chunks_mut::<4>();
+    let (pairs, tail) = groups_out.as_chunks_mut::<2>();
+    for (i, [first, second]) in pairs.iter_mut().enumerate() {
+        // SAFETY: The group count bounds the furthest tap of both vectors.
+        let taps = unsafe { &*src.as_ptr().add(16 * i).cast::<[f32; 20]>() };
+        reduce_group(taps.first_chunk().unwrap(), first);
+        reduce_group(taps.last_chunk().unwrap(), second);
     }
-    done
+    if let [last] = tail {
+        // SAFETY: The last group also fits the validated input length.
+        let taps = unsafe { &*src.as_ptr().add(8 * (groups - 1)).cast::<[f32; 12]>() };
+        reduce_group(taps, last);
+    }
+    4 * groups
 }
 
 #[target_feature(enable = "sse2")]
@@ -139,36 +132,68 @@ pub(crate) fn expand_horizontal_sse2(src: &[f32], dst: &mut [f32]) -> usize {
     assert!(dst.len().is_multiple_of(2));
     let samples = dst.len() / 2;
     assert!(src.len() >= samples + 2);
-    let done = samples / 4 * 4;
-    // SAFETY: SSE2 is enabled. Source covers the three shifted
-    // vectors, and dst covers both interleaved output vectors for every step.
-    unsafe {
-        let taps = src.array_windows::<6>().step_by(4);
-        for (taps, dst) in taps.zip(dst.as_chunks_mut::<8>().0) {
-            let p = taps.as_ptr();
-            let a = _mm_loadu_ps(p);
-            let b = _mm_loadu_ps(p.add(1));
-            let c = _mm_loadu_ps(p.add(2));
-            let even = _mm_add_ps(
-                _mm_mul_ps(_mm_add_ps(a, c), _mm_set1_ps(0.1)),
-                _mm_mul_ps(b, _mm_set1_ps(0.8)),
-            );
-            let odd = _mm_mul_ps(_mm_add_ps(b, c), _mm_set1_ps(0.5));
-            let out = dst.as_mut_ptr();
-            _mm_storeu_ps(out, _mm_unpacklo_ps(even, odd));
-            _mm_storeu_ps(out.add(4), _mm_unpackhi_ps(even, odd));
-        }
+    let groups = samples / 4;
+    let (groups_out, _) = dst[..8 * groups].as_chunks_mut::<8>();
+    let (pairs, tail) = groups_out.as_chunks_mut::<2>();
+    for (i, [first, second]) in pairs.iter_mut().enumerate() {
+        // SAFETY: The group count bounds the furthest tap of both vectors.
+        let taps = unsafe { &*src.as_ptr().add(8 * i).cast::<[f32; 10]>() };
+        expand_group(taps.first_chunk().unwrap(), first);
+        expand_group(taps.last_chunk().unwrap(), second);
     }
-    2 * done
+    if let [last] = tail {
+        // SAFETY: The last group also fits the validated input length.
+        let taps = unsafe { &*src.as_ptr().add(4 * (groups - 1)).cast::<[f32; 6]>() };
+        expand_group(taps, last);
+    }
+    8 * groups
 }
 
 #[inline]
 #[target_feature(enable = "sse2")]
-unsafe fn deinterleave(p: *const f32) -> (__m128, __m128) {
-    // SAFETY: The caller guarantees 8 readable samples and SSE2.
+fn reduce_group(src: &[f32; 12], dst: &mut [f32; 4]) {
+    let (a, b) = deinterleave(src.first_chunk().unwrap());
+    let (c, d) = deinterleave(src[2..].first_chunk().unwrap());
+    let (e, _) = deinterleave(src.last_chunk().unwrap());
+    let value = _mm_add_ps(
+        _mm_add_ps(
+            _mm_mul_ps(_mm_add_ps(a, e), _mm_set1_ps(0.05)),
+            _mm_mul_ps(_mm_add_ps(b, d), _mm_set1_ps(0.25)),
+        ),
+        _mm_mul_ps(c, _mm_set1_ps(0.4)),
+    );
+    // SAFETY: The fixed-size arrays cover every vector load and store.
     unsafe {
-        let a = _mm_loadu_ps(p);
-        let b = _mm_loadu_ps(p.add(4));
+        _mm_storeu_ps(dst.as_mut_ptr(), value);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn expand_group(src: &[f32; 6], dst: &mut [f32; 8]) {
+    // SAFETY: The fixed-size arrays cover every vector load and store.
+    unsafe {
+        let a = _mm_loadu_ps(src.as_ptr());
+        let b = _mm_loadu_ps(src[1..].as_ptr());
+        let c = _mm_loadu_ps(src[2..].as_ptr());
+        let even = _mm_add_ps(
+            _mm_mul_ps(_mm_add_ps(a, c), _mm_set1_ps(0.1)),
+            _mm_mul_ps(b, _mm_set1_ps(0.8)),
+        );
+        let odd = _mm_mul_ps(_mm_add_ps(b, c), _mm_set1_ps(0.5));
+        let (first, second) = dst.split_at_mut(4);
+        _mm_storeu_ps(first.as_mut_ptr(), _mm_unpacklo_ps(even, odd));
+        _mm_storeu_ps(second.as_mut_ptr(), _mm_unpackhi_ps(even, odd));
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse2")]
+fn deinterleave(src: &[f32; 8]) -> (__m128, __m128) {
+    // SAFETY: The fixed-size input covers both loads, and SSE2 is enabled.
+    unsafe {
+        let a = _mm_loadu_ps(src.as_ptr());
+        let b = _mm_loadu_ps(src[4..].as_ptr());
         (_mm_shuffle_ps::<0x88>(a, b), _mm_shuffle_ps::<0xdd>(a, b))
     }
 }

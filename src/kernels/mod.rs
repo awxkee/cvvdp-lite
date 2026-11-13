@@ -96,10 +96,9 @@ pub(crate) struct MaskParameters {
 
 pub(crate) struct Contrast<'a> {
     current: [&'a mut [f32]; 3],
-    expanded: [&'a [f32]; 3],
+    expanded_then_mask: [&'a mut [f32]; 3],
     sensitivity: [&'a [f32]; 3],
     reference: [&'a [f32]; 3],
-    mask: [&'a mut [f32]; 3],
     scale: f32,
 }
 
@@ -139,33 +138,31 @@ pub(crate) struct TiledPool<'a> {
     pub parameters: MaskParameters,
 }
 
+/// Replace the Gaussian and expanded planes with weighted contrast and masks.
 #[allow(unused_mut, unused_unsafe)] // Scalar-only builds have no dispatch block.
 pub(crate) fn contrast(
     backend: Backend,
     current: [&mut [f32]; 3],
-    expanded: [&[f32]; 3],
+    expanded_then_mask: [&mut [f32]; 3],
     sensitivity: [&[f32]; 3],
     reference: [&[f32]; 3],
-    mask: [&mut [f32]; 3],
     scale: f32,
 ) {
     assert!(backend.is_available());
     let count = current[0].len();
     assert!(current.iter().all(|p| p.len() == count));
     assert!(
-        expanded
+        sensitivity
             .iter()
-            .chain(&sensitivity)
             .chain(&reference)
             .all(|p| p.len() == count)
     );
-    assert!(mask.iter().all(|p| p.len() == count));
+    assert!(expanded_then_mask.iter().all(|p| p.len() == count));
     let mut data = Contrast {
         current,
-        expanded,
+        expanded_then_mask,
         sensitivity,
         reference,
-        mask,
         scale,
     };
     let mut done = 0;
@@ -188,13 +185,14 @@ pub(crate) fn contrast(
     }
     let _ = backend;
     for i in done..count {
-        let inv_bg = 1.0 / data.expanded[0][i].max(0.01);
+        let inv_bg = 1.0 / data.expanded_then_mask[0][i].max(0.01);
         for c in 0..3 {
-            let weighted = ((data.current[c][i] - data.expanded[c][i]) * inv_bg).min(1000.0)
+            let low = &mut data.expanded_then_mask[c][i];
+            let weighted = ((data.current[c][i] - *low) * inv_bg).min(1000.0)
                 * data.scale
                 * data.sensitivity[c][i];
             data.current[c][i] = weighted;
-            data.mask[c][i] = weighted.abs().min(data.reference[c][i].abs());
+            *low = weighted.abs().min(data.reference[c][i].abs());
         }
     }
 }
@@ -280,7 +278,103 @@ pub(crate) fn contrast_region(backend: Backend, mut data: ContrastRegion<'_>) {
     }
 }
 
-#[allow(unused_mut, unused_unsafe)] // Scalar-only builds have no dispatch block.
+pub(crate) type PoolLanes = [[f64; POOL_TILE]; 3];
+type PoolChunk = unsafe fn(&Pool<'_>, &mut PoolLanes, bool) -> (usize, [f64; 3]);
+
+/// Accumulate a band in flattened raster order, reducing SIMD lanes only
+/// after the last complete vector and then adding the final scalar tail.
+pub(crate) struct PoolAccumulator {
+    parameters: MaskParameters,
+    chunk: Option<PoolChunk>,
+    lanes: PoolLanes,
+    scalar_sums: [f64; 3],
+}
+
+impl PoolAccumulator {
+    pub(crate) fn new(backend: Backend, parameters: MaskParameters) -> Self {
+        assert!(backend.is_available());
+        let chunk: Option<PoolChunk> = match backend {
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
+            Backend::Neon => Some(crate::neon::pool_neon),
+            #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+            Backend::Avx2 if std::arch::is_x86_feature_detected!("fma") => {
+                Some(crate::avx::pool_fma_avx2)
+            }
+            #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+            Backend::Avx2 => Some(crate::avx::pool_avx2),
+            #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+            Backend::Sse2 => Some(crate::sse::pool_sse2),
+            _ => None,
+        };
+        Self {
+            parameters,
+            chunk,
+            lanes: [[0.0; POOL_TILE]; 3],
+            scalar_sums: [0.0; 3],
+        }
+    }
+
+    fn data<'a>(
+        &self,
+        current: [&'a [f32]; 3],
+        reference: [&'a [f32]; 3],
+        blurred: [&'a [f32]; 3],
+    ) -> Pool<'a> {
+        let count = current[0].len();
+        assert!(
+            current
+                .iter()
+                .chain(&reference)
+                .chain(&blurred)
+                .all(|p| p.len() == count)
+        );
+        Pool {
+            current,
+            reference,
+            blurred,
+            parameters: self.parameters,
+        }
+    }
+
+    /// All intermediate chunks contain a whole number of SIMD vectors on
+    /// every backend. Eight raster rows meet this constraint at any width.
+    pub(crate) fn push(
+        &mut self,
+        current: [&[f32]; 3],
+        reference: [&[f32]; 3],
+        blurred: [&[f32]; 3],
+    ) {
+        let data = self.data(current, reference, blurred);
+        assert!(current[0].len().is_multiple_of(POOL_TILE));
+        if let Some(chunk) = self.chunk {
+            // SAFETY: The constructor checked the selected kernel's ISA
+            // requirements, and the checked planes cover complete SIMD vectors.
+            unsafe { chunk(&data, &mut self.lanes, false) };
+        } else {
+            pool_scalar_tail(&data, 0, &mut self.scalar_sums);
+        }
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        current: [&[f32]; 3],
+        reference: [&[f32]; 3],
+        blurred: [&[f32]; 3],
+    ) -> [f64; 3] {
+        let data = self.data(current, reference, blurred);
+        let (done, mut squares) = if let Some(chunk) = self.chunk {
+            // SAFETY: The constructor checked ISA support and data checked
+            // equal lengths. The SIMD kernel only reads complete vectors.
+            unsafe { chunk(&data, &mut self.lanes, true) }
+        } else {
+            (0, self.scalar_sums)
+        };
+        pool_scalar_tail(&data, done, &mut squares);
+        squares
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn pool(
     backend: Backend,
     current: [&[f32]; 3],
@@ -288,45 +382,11 @@ pub(crate) fn pool(
     blurred: [&[f32]; 3],
     parameters: MaskParameters,
 ) -> [f64; 3] {
-    assert!(backend.is_available());
-    let count = current[0].len();
-    assert!(
-        current
-            .iter()
-            .chain(&reference)
-            .chain(&blurred)
-            .all(|p| p.len() == count)
-    );
-    let data = Pool {
-        current,
-        reference,
-        blurred,
-        parameters,
-    };
-    let (mut done, mut squares) = (0, [0.0; 3]);
-    // SAFETY: All input planes have the checked initialized count, and backend
-    // is CPU-validated by Workspace. SIMD loops only consume complete vectors.
-    unsafe {
-        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
-        if backend == Backend::Neon {
-            (done, squares) = crate::neon::pool_neon(&data);
-        }
-        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
-        if backend == Backend::Avx2 {
-            (done, squares) = crate::avx::pool_avx2(&data);
-        }
-        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
-        if backend == Backend::Sse2 {
-            (done, squares) = crate::sse::pool_sse2(&data);
-        }
-    }
-    let _ = backend;
-    pool_scalar_tail(&data, done, &mut squares);
-    squares
+    PoolAccumulator::new(backend, parameters).finish(current, reference, blurred)
 }
 
 #[inline]
-fn pool_scalar_tail(data: &Pool<'_>, done: usize, squares: &mut [f64; 3]) {
+pub(crate) fn pool_scalar_tail(data: &Pool<'_>, done: usize, squares: &mut [f64; 3]) {
     let parameters = data.parameters;
     let count = data.current[0].len();
     for i in done..count {
@@ -389,6 +449,9 @@ pub(crate) fn pool_tiles(
         }
         #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
         if backend == Backend::Avx2 {
+            if std::arch::is_x86_feature_detected!("fma") {
+                return crate::avx::pool_tiles_fma_avx2(data, tiles, tile_stride);
+            }
             return crate::avx::pool_tiles_avx2(data, tiles, tile_stride);
         }
         #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
@@ -438,6 +501,9 @@ pub(crate) fn pool_row_parts(
         }
         #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
         if backend == Backend::Avx2 {
+            if std::arch::is_x86_feature_detected!("fma") {
+                return crate::avx::pool_parts_fma_avx2(data, parts, parts_stride);
+            }
             return crate::avx::pool_parts_avx2(data, parts, parts_stride);
         }
         #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
@@ -453,8 +519,8 @@ pub(crate) fn pool_row_parts(
 }
 
 /// Row terms of [`pool_tiles_with`], one output row per strip row.
-#[inline]
-fn pool_parts_with(
+#[inline(always)]
+pub(crate) fn pool_parts_with(
     data: &TiledPool<'_>,
     parts: &mut [[f64; 3]],
     parts_stride: usize,
@@ -478,8 +544,8 @@ fn pool_parts_with(
 }
 
 #[cfg(test)]
-#[inline]
-fn pool_tiles_with(
+#[inline(always)]
+pub(crate) fn pool_tiles_with(
     data: &TiledPool<'_>,
     tiles: &mut [[f64; 3]],
     tile_stride: usize,
@@ -532,8 +598,53 @@ mod tile_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn pool_chunks_match_whole_band_bit_exactly() {
+        let parameters = crate::model::mask_parameters();
+        for backend in [Backend::Scalar, Backend::Neon, Backend::Avx2, Backend::Sse2] {
+            if !backend.is_available() {
+                continue;
+            }
+            for width in [1, 3, 4, 7, 8, 9, 31, 32, 33, 257] {
+                let count = width * 27;
+                let planes: [[Vec<f32>; 3]; 3] = std::array::from_fn(|group| {
+                    std::array::from_fn(|c| {
+                        (0..count)
+                            .map(|i| ((i * (53 + group) + c * 23) % 301) as f32 / 17.0)
+                            .collect()
+                    })
+                });
+                let [current, reference, blurred] = planes
+                    .each_ref()
+                    .map(|group| group.each_ref().map(Vec::as_slice));
+                let expected = pool(backend, current, reference, blurred, parameters);
+                let mut accumulator = PoolAccumulator::new(backend, parameters);
+                let chunk = width * 8;
+                for start in [0, chunk, 2 * chunk] {
+                    let end = start + chunk;
+                    accumulator.push(
+                        current.map(|p| &p[start..end]),
+                        reference.map(|p| &p[start..end]),
+                        blurred.map(|p| &p[start..end]),
+                    );
+                }
+                let start = 3 * chunk;
+                let actual = accumulator.finish(
+                    current.map(|p| &p[start..]),
+                    reference.map(|p| &p[start..]),
+                    blurred.map(|p| &p[start..]),
+                );
+                assert_eq!(
+                    actual.map(f64::to_bits),
+                    expected.map(f64::to_bits),
+                    "{backend:?} at width {width}"
+                );
+            }
+        }
+    }
+
     #[allow(unused_mut, unused_unsafe)]
-    fn powers(backend: Backend, input: &[f32], output: &mut [f32], exponent: f32) {
+    fn powers(backend: Backend, fma: bool, input: &[f32], output: &mut [f32], exponent: f32) {
         assert!(backend.is_available());
         assert_eq!(input.len(), output.len());
         assert!(input.iter().all(|x| x.is_normal() && *x > 0.0));
@@ -547,13 +658,19 @@ mod tests {
             }
             #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
             if backend == Backend::Avx2 {
-                done = crate::avx::powers_avx2(input, output, exponent);
+                done = if fma {
+                    assert!(std::arch::is_x86_feature_detected!("fma"));
+                    crate::avx::powers_fma_avx2(input, output, exponent)
+                } else {
+                    crate::avx::powers_avx2(input, output, exponent)
+                };
             }
             #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
             if backend == Backend::Sse2 {
                 done = crate::sse::powers_sse2(input, output, exponent);
             }
         }
+        let _ = fma;
         for i in done..input.len() {
             output[i] = input[i].powf(exponent);
         }
@@ -564,19 +681,27 @@ mod tests {
         let input: Vec<f32> = (0..10003)
             .map(|i| 2.0_f32.powf(-16.6 + i as f32 * 40.0 / 10002.0))
             .collect();
-        for backend in [Backend::Scalar, Backend::Neon, Backend::Avx2, Backend::Sse2] {
+        let variants = [
+            Some((Backend::Scalar, false)),
+            Some((Backend::Neon, false)),
+            Some((Backend::Sse2, false)),
+            Some((Backend::Avx2, false)),
+            #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+            std::arch::is_x86_feature_detected!("fma").then_some((Backend::Avx2, true)),
+        ];
+        for (backend, fma) in variants.into_iter().flatten() {
             if !backend.is_available() {
                 continue;
             }
             for exponent in [MASK_P, MASK_Q[0], MASK_Q[1], MASK_Q[2]] {
                 let mut output = vec![0.0; input.len()];
-                powers(backend, &input, &mut output, exponent);
+                powers(backend, fma, &input, &mut output, exponent);
                 for (&x, &got) in input.iter().zip(&output) {
                     let expected = x.powf(exponent);
                     let relative = (got / expected - 1.0).abs();
                     assert!(
                         relative < 0.000002,
-                        "{backend:?}: {x}^{exponent} {got} != {expected}, error={relative}"
+                        "{backend:?} (AVX2 FMA={fma}): {x}^{exponent} {got} != {expected}, error={relative}"
                     );
                 }
             }
